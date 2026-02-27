@@ -1,17 +1,17 @@
-# fMRI BrainViT VAE — Stage 1 (Subject 01)
+# fMRI BrainViT VAE — Stage 1 (Subject 02)
 # ViT Architecture: Patch sequence encoding
 
 model_type: "vit"
 
 data:
   root: "Data/nsd"
-  subject: "subj01"
+  subject: "subj02"
   train_rep_mode: "single_trial"
   test_rep_mode: "average"
 
 model:
-  n_voxels: 15724
-  patch_size: 124        # 15872 / 128 = 124 (requires 148 padding)
+  n_voxels: 14278
+  patch_size: 112        # 14336 / 128 = 112 (requires 58 padding)
   embed_dim: 512
   depth: 6
   heads: 8
@@ -32,7 +32,7 @@ training:
   grad_clip: 1.0
   seed: 42
   num_workers: 4
-  save_dir: "results/subj01/stage1_vit_vae"
+  save_dir: "results/subj02/stage1_vit_vae"
   log_interval: 50
   val_interval: 1
   use_amp: true

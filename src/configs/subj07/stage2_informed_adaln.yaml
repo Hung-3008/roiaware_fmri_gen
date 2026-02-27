@@ -42,8 +42,8 @@ simple_flow:
   pool_method: "cls"
 
 training:
-  num_epochs: 500
-  batch_size: 256
+  num_epochs: 150
+  batch_size: 128
   lr: 3.0e-4
   weight_decay: 0.05
   grad_clip: 1.0
@@ -55,7 +55,7 @@ training:
   sigma: 0.01
   ode_steps: 50
   num_trials: 1
-  patience: 100
+  patience: 0
   save_every: 50
   eval_interval: 5
   prior_sigma: 0.3

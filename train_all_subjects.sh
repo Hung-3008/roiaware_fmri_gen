@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# Train all subjects: Stage 1 (MoE VAE) → Stage 2 (Informed AdaLN Flow)
-# Models: MoE VAE (4 experts, top-2) + Informed Prior + SimpleAdaLNFlow
+# Train all subjects: Stage 1 (ViT VAE) → Stage 2 (Masked Brain Modeling)
+# Models: ViT VAE + Masked Brain DiT
 #
 # Usage:
 #   bash train_all_subjects.sh          # train all
@@ -12,23 +12,24 @@ set -e
 if [ $# -gt 0 ]; then
     SUBJECTS=("$@")
 else
-    SUBJECTS=(01 02 05 07)
+    SUBJECTS=(05 07)
+    #SUBJECTS=(02)
 fi
 
 CONFIG_DIR="src/configs"
 
 echo "=========================================="
-echo "Training Pipeline: MoE VAE + Informed AdaLN"
+echo "Training Pipeline: ViT VAE + Masked DiT"
 echo "Subjects: ${SUBJECTS[*]}"
 echo "=========================================="
 
 for sub in "${SUBJECTS[@]}"; do
     echo ""
     echo "=========================================="
-    echo " Subject ${sub} — Stage 1: MoE VAE"
+    echo " Subject ${sub} — Stage 1: ViT VAE"
     echo "=========================================="
     python -m src.train_stage1_mlp_vae \
-        --config ${CONFIG_DIR}/subj${sub}/stage1_moe_vae.yaml
+        --config ${CONFIG_DIR}/subj${sub}/stage1_vit_vae.yaml
     if [ $? -ne 0 ]; then
         echo "ERROR: Stage 1 failed for subj${sub}!"
         exit 1
@@ -36,10 +37,10 @@ for sub in "${SUBJECTS[@]}"; do
 
     echo ""
     echo "=========================================="
-    echo " Subject ${sub} — Stage 2: Informed AdaLN Flow"
+    echo " Subject ${sub} — Stage 2: Masked Brain DiT"
     echo "=========================================="
-    python -m src.train_stage2_informed_flow \
-        --config ${CONFIG_DIR}/subj${sub}/stage2_informed_adaln.yaml
+    python -m src.train_stage2_masked \
+        --config ${CONFIG_DIR}/subj${sub}/stage2_masked_vit_vae.yaml
     if [ $? -ne 0 ]; then
         echo "ERROR: Stage 2 failed for subj${sub}!"
         exit 1

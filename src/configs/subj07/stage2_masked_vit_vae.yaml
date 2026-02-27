@@ -1,9 +1,9 @@
-# Stage 2: Masked Brain Modeling — Subject 01 (ViT VAE)
+# Stage 2: Masked Brain Modeling — Subject 07 (ViT VAE)
 data:
   root: "Data/nsd"
-  subject: "subj01"
-  vae_checkpoint: "results/subj01/stage1_vit_vae/best.pt"
-  roi_dir: "Data/nsddata/ppdata/subj01/func1pt8mm/roi"
+  subject: "subj07"
+  vae_checkpoint: "results/subj07/stage1_vit_vae/best.pt"
+  roi_dir: "Data/nsddata/ppdata/subj07/func1pt8mm/roi"
   dino_suffix: "dinov2_vitb14_multilayer"
 
 dino_layers: [3, 6, 9, 12]
@@ -23,7 +23,7 @@ model:
 
 training:
   num_epochs: 150
-  batch_size: 256
+  batch_size: 128
   lr: 3.0e-4
   weight_decay: 0.1
   grad_clip: 1.0
@@ -36,4 +36,4 @@ training:
   save_every: 50
   eval_interval: 5
 
-output_dir: "results/subj01/stage2_masked_vit_vae"
+output_dir: "results/subj07/stage2_masked_vit_vae"

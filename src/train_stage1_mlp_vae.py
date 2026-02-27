@@ -325,10 +325,11 @@ def main():
         if mode == "w":
             writer.writerow(csv_header)
 
+    es_patience = cfg["training"].get("early_stopping_patience", 50)
     early_stopping = EarlyStopping(
-        patience=cfg["training"].get("early_stopping_patience", 50),
+        patience=es_patience,
         mode="max",
-    )
+    ) if es_patience > 0 else None
 
     # ── Training Loop ──
     logger.info(f"Training for {total_epochs} epochs...")
@@ -380,10 +381,11 @@ def main():
             )
             logger.info(f"  ★ New best PCC: {best_val_pcc:.4f}")
 
-        early_stopping(val_pcc)
-        if early_stopping.should_stop:
-            logger.info(f"Early stopping at epoch {epoch}")
-            break
+        if early_stopping is not None:
+            early_stopping(val_pcc)
+            if early_stopping.should_stop:
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
 
     # Bug fix: guard against NameError when the training loop never ran
     # (e.g. start_epoch == total_epochs on resume).

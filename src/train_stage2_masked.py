@@ -355,7 +355,7 @@ def main():
             else:
                 patience_counter += eval_interval
 
-            if patience_counter >= patience:
+            if patience > 0 and patience_counter >= patience:
                 logger.info(f"Early stopping at epoch {epoch}")
                 break
 

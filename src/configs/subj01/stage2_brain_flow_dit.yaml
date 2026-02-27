@@ -24,8 +24,8 @@ model:
   regressor_depth: 2
 
 training:
-  num_epochs: 500
-  batch_size: 256
+  num_epochs: 150
+  batch_size: 128
   lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
@@ -53,4 +53,4 @@ training:
   ema_decay: 0.999
   eval_interval: 10
   save_every: 50
-  patience: 100
+  patience: 0
