@@ -41,7 +41,8 @@ import gc
 # Path setup for MindEye2 dependencies
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MINDEYE_SRC = os.path.join(SCRIPT_DIR, 'MindeEyeV2', 'src')
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+MINDEYE_SRC = os.path.join(PROJECT_ROOT, 'Data', 'notes', 'MindEyeV2', 'src')
 MINDEYE_SGM = os.path.join(MINDEYE_SRC, 'generative_models')
 
 for p in [MINDEYE_SRC, MINDEYE_SGM]:
@@ -250,7 +251,7 @@ def run_stage1_5(prior_outs, cache_dir, device):
 
     from transformers import AutoProcessor
     from transformers.generation import GenerationMixin
-    from MindeEyeV2.src.modeling_git import GitForCausalLMClipEmb
+    from modeling_git import GitForCausalLMClipEmb
 
     if GenerationMixin not in GitForCausalLMClipEmb.__mro__:
         GitForCausalLMClipEmb.__bases__ = (GenerationMixin,) + GitForCausalLMClipEmb.__bases__
@@ -279,7 +280,8 @@ def run_stage1_5(prior_outs, cache_dir, device):
                 pixel_values=caption_emb, max_length=20
             )
             caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            captions.append(caption)
+            print(f"DEBUG caption type: {type(caption)}, value: '{caption}'")
+            captions.append(str(caption).strip())
 
     del clip_text_model, clip_convert, processor
     torch.cuda.empty_cache()
@@ -359,13 +361,15 @@ def run_stage2(prior_outs, cache_dir, device):
 # ==============================================================================
 # STAGE 3: Raw image + Caption → Enhanced image via SDXL img2img
 # ==============================================================================
-def run_stage3(raw_images, captions, cache_dir, device):
+def run_stage3(raw_images, captions, cache_dir, device, img2img_strength=13, cfg_scale=5.0):
     """
     Args:
         raw_images: list of np.ndarray, each (224, 224, 3) in [0, 1]
         captions: list of str
         cache_dir: path to checkpoint directory
         device: torch device
+        img2img_strength: denoising unclip step (default 13)
+        cfg_scale: classifier-free guidance scale (default 5.0)
 
     Returns:
         enhanced_images: list of np.ndarray, each (224, 224, 3) in [0, 1]
@@ -437,8 +441,8 @@ def run_stage3(raw_images, captions, cache_dir, device):
         return base_engine.denoiser(base_engine.model, x, sigma, c)
 
     base_engine.sampler.num_steps = 25
-    base_engine.sampler.guider.scale = 5.0
-    img2img_timepoint = 13
+    base_engine.sampler.guider.scale = cfg_scale
+    img2img_timepoint = img2img_strength
 
     def enhance_img(raw_img_np, prompt):
         raw_img = torch.tensor(raw_img_np).permute(2, 0, 1).unsqueeze(0).to(device)
@@ -494,7 +498,8 @@ def run_stage3(raw_images, captions, cache_dir, device):
 def reconstruct(fmri_data=None, fmri_npy=None, nii_dir=None,
                 captions=None,
                 output_dir="evals/recon", cache_dir="Data/checkpoints",
-                hidden_dim=4096, seed=42, device=None):
+                hidden_dim=4096, seed=42, device=None,
+                img2img_strength=13, cfg_scale=5.0):
     """
     End-to-end MindEye2 reconstruction pipeline.
 
@@ -509,6 +514,8 @@ def reconstruct(fmri_data=None, fmri_npy=None, nii_dir=None,
         hidden_dim: MindEye2 hidden dimension (default 4096)
         seed: random seed
         device: torch device (default: auto-detect)
+        img2img_strength: denoising unclip step (default 13)
+        cfg_scale: classifier-free guidance scale (default 5.0)
 
     Returns:
         dict with keys:
@@ -534,7 +541,7 @@ def reconstruct(fmri_data=None, fmri_npy=None, nii_dir=None,
     prior_outs = run_stage1(samples, cache_dir, device, hidden_dim)
 
     # Stage 1.5: CLIP latents → Captions (skip if captions already provided)
-    if captions is not None:
+    if captions is not None and not all(c is None for c in captions):
         assert len(captions) == len(samples), \
             f"Number of captions ({len(captions)}) must match number of fMRI samples ({len(samples)})"
         print(f"\n--- STAGE 1.5: Skipped (using {len(captions)} provided captions) ---")
@@ -545,7 +552,7 @@ def reconstruct(fmri_data=None, fmri_npy=None, nii_dir=None,
     raw_images = run_stage2(prior_outs, cache_dir, device)
 
     # Stage 3: Raw images → Enhanced images
-    enhanced_images = run_stage3(raw_images, captions, cache_dir, device)
+    enhanced_images = run_stage3(raw_images, captions, cache_dir, device, img2img_strength, cfg_scale)
 
     # Save outputs
     for i, label in enumerate(labels):
@@ -592,6 +599,10 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="Data/checkpoints")
     parser.add_argument("--hidden_dim", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--img2img_strength", type=int, default=13,
+                        help="Denoising steps for MindEye Stage 3 (default: 13, lower = closer to CLIP raw image)")
+    parser.add_argument("--cfg_scale", type=float, default=5.0,
+                        help="Classifier-free guidance scale for caption conditioning (default: 5.0, lower = less bias to caption)")
     args = parser.parse_args()
 
     if args.fmri_npy is None and args.nii_dir is None:
@@ -615,6 +626,8 @@ def main():
         cache_dir=args.cache_dir,
         hidden_dim=args.hidden_dim,
         seed=args.seed,
+        img2img_strength=args.img2img_strength,
+        cfg_scale=args.cfg_scale,
     )
 
 

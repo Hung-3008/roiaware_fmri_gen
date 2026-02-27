@@ -54,7 +54,7 @@ for mode in ['train', 'test']:
         print(f"Warning: {npy_path} not found. Skipping {mode} mode.")
         continue
 
-    data = np.load(npy_path)
+    data = np.load(npy_path, mmap_mode='r')  # Memory-map to avoid loading ~5GB into RAM
     print(f"[{mode}] Data shape: {data.shape}")  # (N, 425, 425, 3)
 
     output_dir = os.path.join(PROCESSED_DATA_DIR, f'subj0{sub}', f'{mode}_img')
@@ -63,8 +63,10 @@ for mode in ['train', 'test']:
     for i in range(data.shape[0]):
         img = Image.fromarray(data[i].astype(np.uint8))
         img.save(os.path.join(output_dir, f"{i}.png"))
+        if (i + 1) % 500 == 0:
+            print(f"  [{mode}] Saved {i+1}/{data.shape[0]} images...")
 
-    print(f"[{mode}] All images saved to: {output_dir}")
+    print(f"[{mode}] All {data.shape[0]} images saved to: {output_dir}")
 
 # ==============================================================================
 # PART 2: Create evaluation tensor (original save_images_eval.py logic)
@@ -73,7 +75,7 @@ for mode in ['train', 'test']:
 test_npy_path = os.path.join(PROCESSED_DATA_DIR, f'subj0{sub}', f'nsd_test_stim_sub{sub}.npy')
 
 if os.path.exists(test_npy_path):
-    data = np.load(test_npy_path).astype(np.uint8)
+    data = np.load(test_npy_path, mmap_mode='r')  # Memory-map instead of full load
 
     transform = transforms.Compose([
         transforms.ToPILImage(),

@@ -18,19 +18,19 @@ model:
   depth: 6
   num_heads: 12
   mlp_ratio: 4.0
-  dropout: 0.1
-  drop_path_rate: 0.1
+  dropout: 0.25
+  drop_path_rate: 0.2
 
 training:
-  num_epochs: 500
+  num_epochs: 150
   batch_size: 256
   lr: 3.0e-4
-  weight_decay: 0.05
+  weight_decay: 0.1
   grad_clip: 1.0
   warmup_epochs: 10
   use_ema: true
   ema_decay: 0.999
-  mask_ratio: 0.75
+  mask_ratio: 0.85
   mask_loss_only: true
   patience: 100
   save_every: 50
