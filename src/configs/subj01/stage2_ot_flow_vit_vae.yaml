@@ -22,7 +22,7 @@ model:
 
 training:
   num_epochs: 300
-  batch_size: 256
+  batch_size: 128
   lr: 3.0e-4
   weight_decay: 0.1
   grad_clip: 1.0
@@ -30,7 +30,7 @@ training:
   use_ema: true
   ema_decay: 0.999
   cfg_drop_prob: 0.1
-  cfg_scale: 1.0
+  cfg_scale: 1.5
   sigma: 0.01
   ode_steps: 50
   num_trials: 1
