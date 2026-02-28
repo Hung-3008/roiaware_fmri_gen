@@ -1,15 +1,12 @@
 """
-Stage 2: Masked Flow Matching — DINOv2 → fMRI latent.
+Stage 2: Pure Flow Matching with Reconstruction Loss — DINOv2 → fMRI latent.
 
-Combines informed flow matching (from train_stage2_informed_flow.py) with token
-masking regularization. During training, a fraction of latent tokens are replaced
-with learnable mask tokens, forcing the model to rely on DINOv2 context.
+Standard conditional flow matching from N(0,I) to z_true, conditioned on
+DINOv2 features. No regression branch, no masking.
 
-Key differences from informed_flow:
-    - Model: BrainMaskedFlowDiT (with mask_token and mask_ratio)
-    - forward_flow returns (v_pred, mask) instead of just v_pred
-    - Flow loss computed on ALL tokens (not just masked ones)
-    - Logs mask_ratio and fraction of tokens masked
+Loss = flow_weight * L_velocity + recon_weight * L_reconstruction
+  L_velocity = MSE(v_pred, ut)
+  L_recon    = MSE(z_hat, z_true)  where z_hat = z_t + (1-t)*v_pred
 
 Usage:
     python -m src.train_stage2_masked_flow --config src/configs/subj01/stage2_masked_flow_vit_vae.yaml
@@ -117,13 +114,11 @@ def cosine_lr(optimizer, epoch, total, warmup, base_lr, min_lr=1e-6):
     return lr
 
 
-# ─── ODE Wrapper (Informed Prior) ────────────────────────────────────────────
+# ─── ODE Wrapper ─────────────────────────────────────────────────────────────
 
 
-class InformedODEWrapper(torch.nn.Module):
-    """ODE wrapper: model predicts velocity in full z-space.
-    x0 is created externally from z_bar + noise.
-    No masking during ODE integration (inference)."""
+class FlowODEWrapper(torch.nn.Module):
+    """ODE wrapper for standard flow: noise → z_true."""
 
     def __init__(self, model, context, cfg_scale=1.0):
         super().__init__()
@@ -135,9 +130,7 @@ class InformedODEWrapper(torch.nn.Module):
         B = z.shape[0]
         t_batch = t.expand(B)
         if self.cfg_scale == 1.0:
-            v, _ = self.model.forward_flow(t_batch, z, self.context,
-                                           mask_ratio=0.0)
-            return v
+            return self.model.forward_flow(t_batch, z, self.context)
         else:
             return self.model.forward_flow_with_cfg(
                 t_batch, z, self.context, self.cfg_scale)
@@ -148,35 +141,24 @@ class InformedODEWrapper(torch.nn.Module):
 
 @torch.no_grad()
 def validate(model, vae, val_loader, fm, device, ode_steps=50,
-             cfg_scale=1.0, num_trials=1, prior_sigma=0.3,
-             decomposer=None):
+             cfg_scale=1.0, num_trials=1, decomposer=None):
     from torchdiffeq import odeint
 
     model.eval()
     total_flow_loss = 0
-    total_reg_loss = 0
     n_batches = 0
     all_pred, all_true = [], []
-    all_z_gen, all_z_true, all_z_bar = [], [], []
+    all_z_gen, all_z_true = [], []
     all_v_cos = []
-    all_delta_std = []
 
     for fmri, dino in val_loader:
         fmri, dino = fmri.to(device), dino.to(device)
         z1, _, _ = vae.encode(fmri, sample_posterior=False)
 
-        # Regression prediction (informed prior center)
-        z_bar = model.forward_regression(dino)
-        reg_loss = F.mse_loss(z_bar, z1)
-        total_reg_loss += reg_loss.item()
-
-        delta_z = z1 - z_bar
-        all_delta_std.append(delta_z.std().item())
-
-        # Flow loss on full z with informed prior (no masking for val)
-        x0 = z_bar + prior_sigma * torch.randn_like(z1)
+        # Flow loss (standard: noise → z_true)
+        x0 = torch.randn_like(z1)
         t, xt, ut = fm.sample_location_and_conditional_flow(x0, z1)
-        v_pred, _ = model.forward_flow(t, xt, dino, mask_ratio=0.0)
+        v_pred = model.forward_flow(t, xt, dino)
         flow_loss = F.mse_loss(v_pred, ut)
         total_flow_loss += flow_loss.item()
         n_batches += 1
@@ -184,13 +166,13 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
         cos = F.cosine_similarity(v_pred, ut, dim=-1).mean().item()
         all_v_cos.append(cos)
 
-        # ODE generation from informed prior (no masking)
-        ode_fn = InformedODEWrapper(model, dino, cfg_scale)
+        # ODE generation: noise → z_gen
+        ode_fn = FlowODEWrapper(model, dino, cfg_scale)
         t_span = torch.linspace(0, 1, ode_steps, device=device)
 
         z_gen = torch.zeros_like(z1)
         for _ in range(num_trials):
-            x0_trial = z_bar + prior_sigma * torch.randn_like(z1)
+            x0_trial = torch.randn_like(z1)
             traj = odeint(ode_fn, x0_trial, t_span, method="midpoint")
             z_gen = z_gen + traj[-1]
         z_gen = z_gen / num_trials
@@ -199,7 +181,6 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
 
         all_z_gen.append(z_gen)
         all_z_true.append(z1)
-        all_z_bar.append(z_bar)
         all_pred.append(fmri_pred)
         all_true.append(fmri)
 
@@ -209,21 +190,14 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
     trues = torch.cat(all_true)
     z_gens = torch.cat(all_z_gen)
     z_trues = torch.cat(all_z_true)
-    z_bars = torch.cat(all_z_bar)
 
     z_gen_std = z_gens.std().item()
     z_gen_cross_var = z_gens.var(dim=0).mean().item()
     z_true_cross_var = z_trues.var(dim=0).mean().item()
 
     metrics = {
-        "val_reg_loss": total_reg_loss / max(n_batches, 1),
         "val_flow_loss": total_flow_loss / max(n_batches, 1),
         "val_v_cos": sum(all_v_cos) / len(all_v_cos),
-        "val_delta_std": sum(all_delta_std) / len(all_delta_std),
-        # Regression-only
-        "val_reg_latent_mse": F.mse_loss(z_bars, z_trues).item(),
-        "val_reg_latent_pcc": pearson_corr_samplewise(z_bars, z_trues),
-        # Combined (z_gen from ODE)
         "val_latent_mse": F.mse_loss(z_gens, z_trues).item(),
         "val_latent_pcc": pearson_corr_samplewise(z_gens, z_trues),
         "val_zgen_std": z_gen_std,
@@ -253,7 +227,7 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
 
 def main():
     parser = argparse.ArgumentParser(
-        "Stage 2: Masked Flow Matching")
+        "Stage 2: Pure Flow Matching + Reconstruction Loss")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -279,9 +253,8 @@ def main():
     ode_steps = train_cfg.get("ode_steps", 50)
     num_trials = train_cfg.get("num_trials", 1)
     eval_interval = 1 if args.debug else train_cfg.get("eval_interval", 5)
-    prior_sigma = train_cfg.get("prior_sigma", 0.3)
     flow_weight = train_cfg.get("flow_weight", 1.0)
-    reg_weight = train_cfg.get("reg_weight", 1.0)
+    recon_weight = train_cfg.get("recon_weight", 0.5)
     timestep_sampling = train_cfg.get("timestep_sampling", "logit_normal")
     logit_normal_mu = train_cfg.get("logit_normal_mu", 0.0)
     logit_normal_sigma = train_cfg.get("logit_normal_sigma", 1.0)
@@ -300,7 +273,7 @@ def main():
         handlers=[logging.StreamHandler(),
                   logging.FileHandler(log_file, mode='w')],
     )
-    logger = logging.getLogger('stage2_masked_flow')
+    logger = logging.getLogger('stage2_flow')
     logger.info(f"Config: {cfg}")
 
     # ── ROI Decomposer ──
@@ -375,10 +348,9 @@ def main():
     ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
-        f"BrainMaskedFlowDiT: reg={pc.get('reg_M', 0):.1f}M "
-        f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
-        f" | EMA={'ON' if use_ema else 'OFF'}"
-        f" | mask_ratio={model.config.mask_ratio}")
+        f"BrainFlowDiT (Pure): flow={pc['flow_M']:.1f}M "
+        f"total={pc['total_M']:.1f}M"
+        f" | EMA={'ON' if use_ema else 'OFF'}")
 
     # ── Flow Matcher ──
     fm = ConditionalFlowMatcher(sigma=train_cfg.get("sigma", 0.0))
@@ -392,10 +364,9 @@ def main():
     history_path = os.path.join(output_dir, "history.csv")
     roi_fields = [f"roi_{n}_spcc" for n in roi_names]
     fields = [
-        "epoch", "train_loss", "reg_loss", "flow_loss", "delta_std",
-        "mask_frac", "lr", "grad_avg", "grad_max",
-        "val_reg_loss", "val_flow_loss", "val_v_cos", "val_delta_std",
-        "val_reg_latent_mse", "val_reg_latent_pcc",
+        "epoch", "train_loss", "flow_loss", "recon_loss",
+        "lr", "grad_avg", "grad_max",
+        "val_flow_loss", "val_v_cos",
         "val_latent_mse", "val_latent_pcc",
         "val_zgen_std", "val_zgen_crossvar_ratio",
         "val_fmri_mse", "val_fmri_pcc", "val_fmri_spcc",
@@ -411,11 +382,9 @@ def main():
     mixing_log_path = os.path.join(output_dir, "layer_mixing.csv")
     dino_layer_names = cfg.get("dino_layers", [6, 12, 18, 24])
     mixing_fields = ["epoch"]
-    for prefix, n_blocks in [("reg", model_cfg.get("reg_depth", 4)),
-                              ("flow", model_cfg.get("depth", 4))]:
-        for b in range(n_blocks):
-            for l in dino_layer_names:
-                mixing_fields.append(f"{prefix}_block{b}_layer{l}")
+    for b in range(model_cfg.get("depth", 4)):
+        for l in dino_layer_names:
+            mixing_fields.append(f"flow_block{b}_layer{l}")
     with open(mixing_log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=mixing_fields).writeheader()
 
@@ -426,19 +395,16 @@ def main():
     logger.info(
         f"Training {num_epochs} epochs, eval every {eval_interval} | {ts_info}")
     logger.info(
-        f"MASKED FLOW MODE | prior_sigma={prior_sigma} "
-        f"flow_weight={flow_weight} reg_weight={reg_weight} "
-        f"mask_ratio={model.config.mask_ratio}")
+        f"PURE FLOW + RECON | flow_weight={flow_weight} "
+        f"recon_weight={recon_weight}")
 
     for epoch in range(1, num_epochs + 1):
         model.train()
         current_lr = cosine_lr(
             optimizer, epoch - 1, num_epochs, warmup_epochs, lr)
 
-        ep_reg, ep_flow, ep_total, n_steps = 0, 0, 0, 0
+        ep_flow, ep_recon, ep_total, n_steps = 0, 0, 0, 0
         grads_all, grads_max_all = [], []
-        delta_stds = []
-        mask_fracs = []
         t0 = time.time()
 
         for batch_idx, (fmri, dino) in enumerate(train_loader):
@@ -448,15 +414,8 @@ def main():
             with torch.no_grad():
                 z1, _, _ = vae.encode(fmri, sample_posterior=False)
 
-            # ─── End-to-end: regression predicts z̄ ───────────────────
-            z_bar = model.forward_regression(dino)
-            loss_reg = F.mse_loss(z_bar, z1)
-
-            delta_z = (z1 - z_bar).detach()
-            delta_stds.append(delta_z.std().item())
-
-            # ─── Informed prior: x0 = z̄ + σ·ε ──────────────────────
-            x0 = z_bar + prior_sigma * torch.randn_like(z1)
+            # ─── Standard Flow: x0 = noise, x1 = z_true ─────────
+            x0 = torch.randn_like(z1)
 
             # CFG dropout on context
             context = dino
@@ -479,20 +438,24 @@ def main():
                 t, xt, ut = fm.sample_location_and_conditional_flow(
                     x0, z1)
 
-            # Forward flow WITH masking (uses config.mask_ratio during training)
-            v_pred, mask = model.forward_flow(t, xt, context)
+            # Forward: predict velocity
+            v_pred = model.forward_flow(t, xt, context)
 
-            # Flow loss on ALL tokens
+            # ─── Loss 1: Velocity Matching ───────────────────────
             loss_flow = F.mse_loss(v_pred, ut)
 
-            # Track mask fraction
-            if mask.any():
-                mask_fracs.append(mask.float().mean().item())
-            else:
-                mask_fracs.append(0.0)
+            # ─── Loss 2: One-step Reconstruction ─────────────────
+            # Euler estimate: z_hat ≈ z at t=1
+            # z_hat = z_t + (1 - t) * v_pred
+            # Gradient: dL/dv = 2*(1-t)*(z_hat - z1) → naturally
+            #   weights early timesteps more (where reconstruction
+            #   prediction is harder and more informative)
+            t_weight = (1 - t)[:, None]  # (B, 1)
+            z_hat = xt + t_weight * v_pred  # (B, latent_dim)
+            loss_recon = F.mse_loss(z_hat, z1)
 
-            # ─── Combined loss: end-to-end ───────────────────────────
-            loss = flow_weight * loss_flow + reg_weight * loss_reg
+            # ─── Combined loss ───────────────────────────────────
+            loss = flow_weight * loss_flow + recon_weight * loss_recon
 
             optimizer.zero_grad()
             loss.backward()
@@ -503,8 +466,8 @@ def main():
             if use_ema:
                 ema_update(model, ema_model, ema_decay)
 
-            ep_reg += loss_reg.item()
             ep_flow += loss_flow.item()
+            ep_recon += loss_recon.item()
             ep_total += loss.item()
             grads_all.append(gn.item())
             grads_max_all.append(gn.item())
@@ -515,42 +478,33 @@ def main():
                     v_cos = F.cosine_similarity(
                         v_pred, ut, dim=-1).mean().item()
                 logger.info(
-                    f"  [Ep{epoch} B0] reg={loss_reg.item():.4f} "
-                    f"flow={loss_flow.item():.4f} v_cos={v_cos:.4f} "
-                    f"δ_std={delta_z.std().item():.4f} "
-                    f"mask={mask.float().mean().item():.2f}")
+                    f"  [Ep{epoch} B0] flow={loss_flow.item():.4f} "
+                    f"recon={loss_recon.item():.4f} v_cos={v_cos:.4f}")
 
         avg_total = ep_total / max(n_steps, 1)
-        avg_reg = ep_reg / max(n_steps, 1)
         avg_flow = ep_flow / max(n_steps, 1)
+        avg_recon = ep_recon / max(n_steps, 1)
         avg_grad = sum(grads_all) / len(grads_all)
         max_grad = max(grads_max_all)
-        avg_delta_std = (sum(delta_stds) / len(delta_stds)
-                         if delta_stds else 0.0)
-        avg_mask_frac = (sum(mask_fracs) / len(mask_fracs)
-                         if mask_fracs else 0.0)
         ep_time = time.time() - t0
 
         logger.info(
-            f"Ep {epoch:4d}/{num_epochs} ({ep_time:.1f}s) [MASKED FLOW] | "
-            f"total={avg_total:.5f} reg={avg_reg:.5f} "
-            f"flow={avg_flow:.5f} δ_std={avg_delta_std:.4f} "
-            f"mask={avg_mask_frac:.2f} | "
+            f"Ep {epoch:4d}/{num_epochs} ({ep_time:.1f}s) [PURE FLOW+RECON] | "
+            f"total={avg_total:.5f} flow={avg_flow:.5f} "
+            f"recon={avg_recon:.5f} | "
             f"lr={current_lr:.2e} grad={avg_grad:.4f}")
 
         # ── Eval ──
         if epoch % eval_interval == 0 or epoch == 1:
             eval_model = ema_model if use_ema else model
             val = validate(eval_model, vae, val_loader, fm, device,
-                           ode_steps, cfg_scale, num_trials, prior_sigma,
+                           ode_steps, cfg_scale, num_trials,
                            decomposer=decomposer)
 
             row = {"epoch": epoch,
                    "train_loss": f"{avg_total:.6f}",
-                   "reg_loss": f"{avg_reg:.6f}",
                    "flow_loss": f"{avg_flow:.6f}",
-                   "delta_std": f"{avg_delta_std:.4f}",
-                   "mask_frac": f"{avg_mask_frac:.4f}",
+                   "recon_loss": f"{avg_recon:.6f}",
                    "lr": f"{current_lr:.2e}",
                    "grad_avg": f"{avg_grad:.4f}",
                    "grad_max": f"{max_grad:.4f}",
@@ -564,11 +518,8 @@ def main():
             spcc = val["val_fmri_spcc"]
             is_best = spcc > best_pcc
             logger.info(
-                f"  VAL | v_cos={val['val_v_cos']:.4f} "
-                f"δ_std={val['val_delta_std']:.4f} | "
-                f"REG: l_mse={val['val_reg_latent_mse']:.4f} "
-                f"l_pcc={val['val_reg_latent_pcc']:.4f} | "
-                f"GEN: l_mse={val['val_latent_mse']:.4f} "
+                f"  VAL | v_cos={val['val_v_cos']:.4f} | "
+                f"l_mse={val['val_latent_mse']:.4f} "
                 f"l_pcc={val['val_latent_pcc']:.4f} | "
                 f"f_mse={val['val_fmri_mse']:.4f} "
                 f"f_spcc={spcc:.4f} | "
@@ -584,24 +535,22 @@ def main():
             # Layer mixing weights
             mix_w = eval_model.get_layer_mixing_weights()
             mix_row = {"epoch": epoch}
-            for prefix, w in [("reg", mix_w['reg']),
-                               ("flow", mix_w['flow'])]:
-                for b in range(w.shape[0]):
-                    for li, l in enumerate(dino_layer_names):
-                        mix_row[f"{prefix}_block{b}_layer{l}"] = \
-                            f"{w[b, li]:.4f}"
+            w = mix_w['flow']
+            for b in range(w.shape[0]):
+                for li, l in enumerate(dino_layer_names):
+                    mix_row[f"flow_block{b}_layer{l}"] = \
+                        f"{w[b, li]:.4f}"
             with open(mixing_log_path, "a", newline="") as f:
                 csv.DictWriter(f, fieldnames=mixing_fields).writerow(
                     mix_row)
 
             # Print mixing weights
-            for prefix, w in [("REG", mix_w['reg']),
-                               ("FLOW", mix_w['flow'])]:
-                mix_str = " | ".join(
-                    f"B{b}:[" + ",".join(
-                        f"{w[b, i]:.2f}" for i in range(w.shape[1])
-                    ) + "]" for b in range(w.shape[0]))
-                logger.info(f"  {prefix}_MIX | {mix_str}")
+            w = mix_w['flow']
+            mix_str = " | ".join(
+                f"B{b}:[" + ",".join(
+                    f"{w[b, i]:.2f}" for i in range(w.shape[1])
+                ) + "]" for b in range(w.shape[0]))
+            logger.info(f"  FLOW_MIX | {mix_str}")
 
             if is_best:
                 best_pcc = spcc
@@ -611,7 +560,6 @@ def main():
                     "model_state_dict": eval_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_pcc": best_pcc, "config": cfg,
-                    "layer_mixing_reg": mix_w['reg'].numpy(),
                     "layer_mixing_flow": mix_w['flow'].numpy()}
                 torch.save(save_dict,
                     os.path.join(output_dir, "best_model.pt"))
