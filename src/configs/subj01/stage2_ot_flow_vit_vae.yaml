@@ -42,5 +42,4 @@ training:
   timestep_sampling: "logit_normal"
   logit_normal_mu: 0.0
   logit_normal_sigma: 0.7
-
-output_dir: "results/subj01/stage2_masked_flow_vit_vae"
+output_dir: "results/subj01/stage2_ot_flow_vit_vae"

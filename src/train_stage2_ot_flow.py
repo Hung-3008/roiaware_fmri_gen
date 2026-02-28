@@ -9,8 +9,8 @@ Loss = flow_weight * L_velocity + recon_weight * L_reconstruction
   L_recon    = MSE(z_hat, z_true)  where z_hat = z_t + (1-t)*v_pred
 
 Usage:
-    python -m src.train_stage2_masked_flow --config src/configs/subj01/stage2_masked_flow_vit_vae.yaml
-    python -m src.train_stage2_masked_flow --config src/configs/subj01/stage2_masked_flow_vit_vae.yaml --debug
+    python -m src.train_stage2_ot_flow --config src/configs/subj01/stage2_ot_flow_vit_vae.yaml
+    python -m src.train_stage2_ot_flow --config src/configs/subj01/stage2_ot_flow_vit_vae.yaml --debug
 """
 
 import argparse
@@ -27,9 +27,9 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Dataset
 
-from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
+from torchcfm.conditional_flow_matching import ConditionalFlowMatcher, ExactOptimalTransportConditionalFlowMatcher
 
-from src.model.brain_masked_flow_dit import BrainMaskedFlowDiT, BrainMaskedFlowDiTConfig
+from src.model.brain_ot_flow_dit import BrainOTFlowDiT, BrainOTFlowDiTConfig
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
 from src.model.fmri_vit_vae import FmriViTVAE, create_fmri_vit_vae
 from src.utils.roi_utils import ROIDecomposer
@@ -227,7 +227,7 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
 
 def main():
     parser = argparse.ArgumentParser(
-        "Stage 2: Pure Flow Matching + Reconstruction Loss")
+        "Stage 2: Optimal Transport Flow Matching + Reconstruction Loss")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -255,11 +255,18 @@ def main():
     eval_interval = 1 if args.debug else train_cfg.get("eval_interval", 5)
     flow_weight = train_cfg.get("flow_weight", 1.0)
     recon_weight = train_cfg.get("recon_weight", 0.5)
+    recon_space = train_cfg.get("recon_space", "fmri")  # "latent" or "fmri"
+    recon_pcc_weight = train_cfg.get("recon_pcc_weight", 0.1)
+    
+    # New options
+    use_ot = train_cfg.get("use_ot", True)
+    context_mask_ratio = train_cfg.get("context_mask_ratio", 0.3)
+    
     timestep_sampling = train_cfg.get("timestep_sampling", "logit_normal")
     logit_normal_mu = train_cfg.get("logit_normal_mu", 0.0)
     logit_normal_sigma = train_cfg.get("logit_normal_sigma", 1.0)
 
-    output_dir = cfg.get("output_dir", "results/stage2_masked_flow")
+    output_dir = cfg.get("output_dir", "results/stage2_ot_flow")
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "config.yaml"), "w") as f:
         yaml.dump(cfg, f, default_flow_style=False)
@@ -273,7 +280,7 @@ def main():
         handlers=[logging.StreamHandler(),
                   logging.FileHandler(log_file, mode='w')],
     )
-    logger = logging.getLogger('stage2_flow')
+    logger = logging.getLogger('stage2_ot_flow')
     logger.info(f"Config: {cfg}")
 
     # ── ROI Decomposer ──
@@ -343,17 +350,28 @@ def main():
         p.requires_grad = False
     logger.info(f"VAE loaded from {vae_ckpt}")
 
-    # ── Model ──
-    model = BrainMaskedFlowDiT(BrainMaskedFlowDiTConfig(**model_cfg)).to(device)
+    model = BrainOTFlowDiT(BrainOTFlowDiTConfig(**model_cfg)).to(device)
     ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
-        f"BrainFlowDiT (Pure): flow={pc['flow_M']:.1f}M "
+        f"BrainOTFlowDiT (OT): flow={pc['flow_M']:.1f}M "
         f"total={pc['total_M']:.1f}M"
         f" | EMA={'ON' if use_ema else 'OFF'}")
 
-    # ── Flow Matcher ──
-    fm = ConditionalFlowMatcher(sigma=train_cfg.get("sigma", 0.0))
+    # ── Flow Matcher (Minibatch Optimal Transport) ──
+    sigma = train_cfg.get("sigma", 0.0)
+    if use_ot:
+        try:
+            import ot
+            fm = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
+            logger.info(f"Using Minibatch ExactOptimalTransport Flow Matcher (sigma={sigma})")
+        except ImportError:
+            logger.warning("POT library not found (`pip install POT`). Reverting to standard Flow Matching.")
+            fm = ConditionalFlowMatcher(sigma=sigma)
+            use_ot = False
+    else:
+        logger.info(f"Using standard Conditional Flow Matcher (sigma={sigma})")
+        fm = ConditionalFlowMatcher(sigma=sigma)
 
     # ── Optimizer ──
     optimizer = torch.optim.AdamW(
@@ -364,7 +382,8 @@ def main():
     history_path = os.path.join(output_dir, "history.csv")
     roi_fields = [f"roi_{n}_spcc" for n in roi_names]
     fields = [
-        "epoch", "train_loss", "flow_loss", "recon_loss",
+        "epoch", "train_loss", "flow_loss", 
+        "recon_latent_mse", "recon_fmri_mse", "recon_fmri_pcc",
         "lr", "grad_avg", "grad_max",
         "val_flow_loss", "val_v_cos",
         "val_latent_mse", "val_latent_pcc",
@@ -396,14 +415,16 @@ def main():
         f"Training {num_epochs} epochs, eval every {eval_interval} | {ts_info}")
     logger.info(
         f"PURE FLOW + RECON | flow_weight={flow_weight} "
-        f"recon_weight={recon_weight}")
+        f"recon_weight={recon_weight} recon_space={recon_space} "
+        f"recon_pcc_weight={recon_pcc_weight} | "
+        f"OT={use_ot} ContextMask={context_mask_ratio}")
 
     for epoch in range(1, num_epochs + 1):
         model.train()
         current_lr = cosine_lr(
             optimizer, epoch - 1, num_epochs, warmup_epochs, lr)
 
-        ep_flow, ep_recon, ep_total, n_steps = 0, 0, 0, 0
+        ep_flow, ep_recon_lmse, ep_recon_fmse, ep_recon_fpcc, ep_total, n_steps = 0, 0, 0, 0, 0, 0
         grads_all, grads_max_all = [], []
         t0 = time.time()
 
@@ -439,20 +460,44 @@ def main():
                     x0, z1)
 
             # Forward: predict velocity
-            v_pred = model.forward_flow(t, xt, context)
+            # Pass mask ratio to simulate Semantic Dropout
+            v_pred = model.forward_flow(t, xt, context, mask_ratio=context_mask_ratio)
 
             # ─── Loss 1: Velocity Matching ───────────────────────
             loss_flow = F.mse_loss(v_pred, ut)
 
-            # ─── Loss 2: One-step Reconstruction ─────────────────
-            # Euler estimate: z_hat ≈ z at t=1
-            # z_hat = z_t + (1 - t) * v_pred
-            # Gradient: dL/dv = 2*(1-t)*(z_hat - z1) → naturally
-            #   weights early timesteps more (where reconstruction
-            #   prediction is harder and more informative)
+            # ─── Loss 2: Reconstruction ──────────────────────────
             t_weight = (1 - t)[:, None]  # (B, 1)
             z_hat = xt + t_weight * v_pred  # (B, latent_dim)
-            loss_recon = F.mse_loss(z_hat, z1)
+            
+            # 2a. Latent MSE (always tracked for logging)
+            loss_recon_latent = F.mse_loss(z_hat, z1)
+
+            loss_recon_fmri_mse = torch.tensor(0.0, device=device)
+            loss_recon_fmri_pcc = torch.tensor(0.0, device=device)
+
+            if recon_weight > 0.0:
+                if recon_space == "fmri":
+                    # 2b. fMRI Space Decode
+                    # gradient flows through VAE decoder back to z_hat and v_pred
+                    fmri_hat = vae.decode(z_hat)
+                    
+                    # Compute fMRI MSE
+                    loss_recon_fmri_mse = F.mse_loss(fmri_hat, fmri)
+                    
+                    # Compute fMRI PCC (Negative correlation)
+                    pred_zm = fmri_hat - fmri_hat.mean(1, keepdim=True)
+                    tgt_zm = fmri - fmri.mean(1, keepdim=True)
+                    num = (pred_zm * tgt_zm).sum(1)
+                    den = (pred_zm.norm(dim=1) * tgt_zm.norm(dim=1)).clamp(min=1e-8)
+                    pcc = (num / den).mean()
+                    loss_recon_fmri_pcc = 1.0 - pcc
+                    
+                    loss_recon = loss_recon_fmri_mse + recon_pcc_weight * loss_recon_fmri_pcc
+                else:
+                    loss_recon = loss_recon_latent
+            else:
+                loss_recon = torch.tensor(0.0, device=device)
 
             # ─── Combined loss ───────────────────────────────────
             loss = flow_weight * loss_flow + recon_weight * loss_recon
@@ -467,7 +512,9 @@ def main():
                 ema_update(model, ema_model, ema_decay)
 
             ep_flow += loss_flow.item()
-            ep_recon += loss_recon.item()
+            ep_recon_lmse += loss_recon_latent.item()
+            ep_recon_fmse += loss_recon_fmri_mse.item()
+            ep_recon_fpcc += loss_recon_fmri_pcc.item()
             ep_total += loss.item()
             grads_all.append(gn.item())
             grads_max_all.append(gn.item())
@@ -475,23 +522,27 @@ def main():
 
             if batch_idx == 0 and epoch <= 5:
                 with torch.no_grad():
-                    v_cos = F.cosine_similarity(
-                        v_pred, ut, dim=-1).mean().item()
+                    v_cos = F.cosine_similarity(v_pred, ut, dim=-1).mean().item()
                 logger.info(
                     f"  [Ep{epoch} B0] flow={loss_flow.item():.4f} "
-                    f"recon={loss_recon.item():.4f} v_cos={v_cos:.4f}")
+                    f"z_mse={loss_recon_latent.item():.4f} "
+                    f"f_mse={loss_recon_fmri_mse.item():.4f} "
+                    f"f_pcc_loss={loss_recon_fmri_pcc.item():.4f} "
+                    f"v_cos={v_cos:.4f}")
 
         avg_total = ep_total / max(n_steps, 1)
         avg_flow = ep_flow / max(n_steps, 1)
-        avg_recon = ep_recon / max(n_steps, 1)
+        avg_recon_lmse = ep_recon_lmse / max(n_steps, 1)
+        avg_recon_fmse = ep_recon_fmse / max(n_steps, 1)
+        avg_recon_fpcc = ep_recon_fpcc / max(n_steps, 1)
         avg_grad = sum(grads_all) / len(grads_all)
         max_grad = max(grads_max_all)
         ep_time = time.time() - t0
 
         logger.info(
             f"Ep {epoch:4d}/{num_epochs} ({ep_time:.1f}s) [PURE FLOW+RECON] | "
-            f"total={avg_total:.5f} flow={avg_flow:.5f} "
-            f"recon={avg_recon:.5f} | "
+            f"total={avg_total:.5f} flow={avg_flow:.5f} | "
+            f"RECON: z_mse={avg_recon_lmse:.4f} f_mse={avg_recon_fmse:.4f} f_pcc_loss={avg_recon_fpcc:.4f} | "
             f"lr={current_lr:.2e} grad={avg_grad:.4f}")
 
         # ── Eval ──
@@ -504,7 +555,9 @@ def main():
             row = {"epoch": epoch,
                    "train_loss": f"{avg_total:.6f}",
                    "flow_loss": f"{avg_flow:.6f}",
-                   "recon_loss": f"{avg_recon:.6f}",
+                   "recon_latent_mse": f"{avg_recon_lmse:.6f}",
+                   "recon_fmri_mse": f"{avg_recon_fmse:.6f}",
+                   "recon_fmri_pcc": f"{avg_recon_fpcc:.6f}",
                    "lr": f"{current_lr:.2e}",
                    "grad_avg": f"{avg_grad:.4f}",
                    "grad_max": f"{max_grad:.4f}",

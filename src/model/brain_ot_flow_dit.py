@@ -1,5 +1,5 @@
 """
-BrainMaskedFlowDiT — Pure Flow Matching DiT with Reconstruction Loss.
+BrainOTFlowDiT — Pure Flow Matching DiT with Optimal Transport and Reconstruction Loss.
 
 Standard conditional flow matching: N(0,I) → z_true (fMRI latent),
 conditioned on DINOv2 multi-layer features via Prefix Token Early Fusion.
@@ -51,8 +51,7 @@ def modulate(x, shift, scale):
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 
-@dataclass
-class BrainMaskedFlowDiTConfig:
+class BrainOTFlowDiTConfig:
     # Latent configuration
     latent_dim: int = 768
     n_latent_tokens: int = 12       # 768 = 12 * 64
@@ -135,12 +134,8 @@ class BrainPrefixDiTBlock(nn.Module):
 # ─── Main Model ───────────────────────────────────────────────────────────────
 
 
-class BrainMaskedFlowDiT(nn.Module):
-    """
-    Pure Flow Matching DiT with Prefix Token Early Fusion.
-    Standard flow: N(0,I) → z_true, no regression, no masking.
-    """
-    def __init__(self, config: BrainMaskedFlowDiTConfig):
+class BrainOTFlowDiT(nn.Module):
+    def __init__(self, config: BrainOTFlowDiTConfig):
         super().__init__()
         self.config = config
         D = config.hidden_dim
@@ -159,6 +154,8 @@ class BrainMaskedFlowDiT(nn.Module):
         # ─── 3. Context Embedder (Prefix Tokens) ───
         self.context_proj = nn.Linear(C, D)
         self.context_pos_embed = nn.Parameter(torch.randn(1, 257, D) * 0.02)
+        # Learnable mask token for Semantic Dropout
+        self.context_mask_token = nn.Parameter(torch.randn(1, 1, D) * 0.02)
 
         # ─── 4. Latent Tokenization ───
         assert config.latent_dim % config.n_latent_tokens == 0
@@ -201,7 +198,7 @@ class BrainMaskedFlowDiT(nn.Module):
         w = F.softmax(self.flow_layer_weights, dim=0).view(1, -1, 1, 1)
         return (dino_multilayer * w).sum(dim=1)
 
-    def forward_flow(self, t, z_t, dino_multilayer):
+    def forward_flow(self, t, z_t, dino_multilayer, mask_ratio=0.0):
         """
         Predict velocity v(z_t, t | DINOv2).
 
@@ -209,6 +206,7 @@ class BrainMaskedFlowDiT(nn.Module):
             t: (B,) timestep
             z_t: (B, latent_dim) noisy state
             dino_multilayer: (B, L, 257, context_dim)
+            mask_ratio: float, percentage of context tokens to mask (Semantic dropout)
 
         Returns:
             v_pred: (B, latent_dim) predicted velocity
@@ -219,6 +217,15 @@ class BrainMaskedFlowDiT(nn.Module):
         # 1. Context embedding (Prefix Tokens)
         dino_mixed = self._process_context(dino_multilayer)
         context = self.context_proj(dino_mixed) + self.context_pos_embed
+
+        # Semantic dropout (Context Masking)
+        if mask_ratio > 0.0 and self.training:
+            # Mask out context tokens with probability mask_ratio
+            mask = torch.rand(B, 257, device=z_t.device) < mask_ratio
+            # Create a full sequence of mask tokens
+            mask_tokens = self.context_mask_token.expand(B, 257, -1)
+            # Replace selected tokens with mask_tokens
+            context = torch.where(mask.unsqueeze(-1), mask_tokens, context)
 
         # 2. Timestep conditioning
         t_emb = timestep_embedding(t * 1000, self.config.hidden_dim)
@@ -258,14 +265,21 @@ class BrainMaskedFlowDiT(nn.Module):
         dino_mixed = self._process_context(dino_multilayer)
         context = self.context_proj(dino_mixed) + self.context_pos_embed
 
+        # Unconditional context is completely masked
+        context_cond = context
+        context_uncond = self.context_mask_token.expand(B, 257, -1).clone()
+        context_batched = torch.cat([context_cond, context_uncond], dim=0)
+
         t_emb = timestep_embedding(t * 1000, self.config.hidden_dim)
         t_cond = self.t_embedder(t_emb)
 
         # Latent
-        z_seq = z_t.view(2 * B, N, self.token_dim)
-        x = self.latent_proj(z_seq) + self.latent_pos_embed
+        z_seq_cond = z_t.view(B, N, self.token_dim)
+        z_seq_uncond = z_seq_cond.clone()
+        z_seq_batched = torch.cat([z_seq_cond, z_seq_uncond], dim=0)
+        x = self.latent_proj(z_seq_batched) + self.latent_pos_embed
 
-        seq = torch.cat([context, x], dim=1)
+        seq = torch.cat([context_batched, x], dim=1)
 
         for block in self.blocks:
             seq = block(seq, t_cond)
