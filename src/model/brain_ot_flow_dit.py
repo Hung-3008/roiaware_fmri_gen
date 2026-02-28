@@ -51,6 +51,7 @@ def modulate(x, shift, scale):
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 
+@dataclass
 class BrainOTFlowDiTConfig:
     # Latent configuration
     latent_dim: int = 768

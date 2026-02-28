@@ -39,6 +39,10 @@ training:
   eval_interval: 5
   flow_weight: 1.0
   recon_weight: 0.5
+  recon_space: "fmri"
+  recon_pcc_weight: 0.1
+  use_ot: true
+  context_mask_ratio: 0.3
   timestep_sampling: "logit_normal"
   logit_normal_mu: 0.0
   logit_normal_sigma: 0.7
