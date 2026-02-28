@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# Train all subjects: Stage 1 (ViT VAE) → Stage 2 (Masked Brain Modeling)
-# Models: ViT VAE + Masked Brain DiT
+# Train all subjects: Stage 2 only (Masked Brain Modeling, mask_ratio=0.75)
+# Stage 1 (ViT VAE) is already trained — reusing existing checkpoints.
 #
 # Usage:
 #   bash train_all_subjects.sh          # train all
@@ -12,35 +12,23 @@ set -e
 if [ $# -gt 0 ]; then
     SUBJECTS=("$@")
 else
-    SUBJECTS=(05 07)
-    #SUBJECTS=(02)
+    SUBJECTS=(02 05 07)
 fi
 
 CONFIG_DIR="src/configs"
 
 echo "=========================================="
-echo "Training Pipeline: ViT VAE + Masked DiT"
+echo "Training Pipeline: Stage 2 Only (mask_ratio=0.75)"
 echo "Subjects: ${SUBJECTS[*]}"
 echo "=========================================="
 
 for sub in "${SUBJECTS[@]}"; do
     echo ""
     echo "=========================================="
-    echo " Subject ${sub} — Stage 1: ViT VAE"
-    echo "=========================================="
-    python -m src.train_stage1_mlp_vae \
-        --config ${CONFIG_DIR}/subj${sub}/stage1_vit_vae.yaml
-    if [ $? -ne 0 ]; then
-        echo "ERROR: Stage 1 failed for subj${sub}!"
-        exit 1
-    fi
-
-    echo ""
-    echo "=========================================="
-    echo " Subject ${sub} — Stage 2: Masked Brain DiT"
+    echo " Subject ${sub} — Stage 2: Masked Brain DiT (mask_ratio=0.75)"
     echo "=========================================="
     python -m src.train_stage2_masked \
-        --config ${CONFIG_DIR}/subj${sub}/stage2_masked_vit_vae.yaml
+        --config ${CONFIG_DIR}/subj${sub}/stage2_masked_vit_vae_mr075.yaml
     if [ $? -ne 0 ]; then
         echo "ERROR: Stage 2 failed for subj${sub}!"
         exit 1
