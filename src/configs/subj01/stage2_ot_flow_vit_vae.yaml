@@ -42,7 +42,7 @@ training:
   recon_space: "fmri"
   recon_pcc_weight: 0.1
   use_ot: true
-  context_mask_ratio: 0.3
+  context_mask_ratio: 0.5
   timestep_sampling: "logit_normal"
   logit_normal_mu: 0.0
   logit_normal_sigma: 0.7

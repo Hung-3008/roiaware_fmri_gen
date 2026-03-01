@@ -259,7 +259,7 @@ class BrainOTFlowDiT(nn.Module):
         if cfg_scale == 1.0:
             return self.forward_flow(t, z_t, dino_multilayer)
 
-        B = z_t.shape[0] // 2
+        B = z_t.shape[0]
         N = self.config.n_latent_tokens
 
         # Context
@@ -273,6 +273,7 @@ class BrainOTFlowDiT(nn.Module):
 
         t_emb = timestep_embedding(t * 1000, self.config.hidden_dim)
         t_cond = self.t_embedder(t_emb)
+        t_cond = torch.cat([t_cond, t_cond], dim=0)
 
         # Latent
         z_seq_cond = z_t.view(B, N, self.token_dim)
