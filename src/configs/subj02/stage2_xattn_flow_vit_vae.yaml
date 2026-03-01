@@ -1,9 +1,9 @@
-# Stage 2: Cross-Attention Flow Matching + Self-Conditioning — Subject 01 (ViT VAE)
+# Stage 2: Cross-Attention Flow Matching + Self-Conditioning — Subject 02 (ViT VAE)
 data:
   root: "Data/nsd"
-  subject: "subj01"
-  vae_checkpoint: "results/subj01/stage1_vit_vae/best.pt"
-  roi_dir: "Data/nsddata/ppdata/subj01/func1pt8mm/roi"
+  subject: "subj02"
+  vae_checkpoint: "results/subj02/stage1_vit_vae/best.pt"
+  roi_dir: "Data/nsddata/ppdata/subj02/func1pt8mm/roi"
   dino_suffix: "dinov2_vitb14_multilayer"
 
 dino_layers: [3, 6, 9, 12]
@@ -50,11 +50,11 @@ training:
   flow_weight: 1.0
 
   # Noise-robust loss
-  sigma_aug: 0.3           # σ-augmented targets (noise level added to z_true)
-  huber_delta: 1.0         # Huber loss threshold (linear beyond this)
-  use_snr_weights: true    # Per-dim SNR weighting from VAE posterior
+  sigma_aug: 0.3
+  huber_delta: 1.0
+  use_snr_weights: true
 
   # Timestep sampling
   timestep_sampling: "uniform"
 
-output_dir: "results/subj01/stage2_xattn_flow_vit_vae"
+output_dir: "results/subj02/stage2_xattn_flow_vit_vae"
