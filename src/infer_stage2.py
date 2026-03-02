@@ -30,9 +30,44 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.model.brain_masked_dit import BrainMaskedDiT, BrainMaskedDiTConfig
+from src.model.brain_cond_flow import BrainCondFlow, BrainCondFlowConfig
 from src.model.fmri_vit_vae import FmriViTVAE, create_fmri_vit_vae
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
+
+from torchdiffeq import odeint
+
+class CondFlowODEWrapper(torch.nn.Module):
+    """ODE wrapper: model predicts velocity for direct flow."""
+    def __init__(self, model, context, cfg_scale=1.0):
+        super().__init__()
+        self.model = model
+        self.context = context
+        self.cfg_scale = cfg_scale
+
+    def forward(self, t, z):
+        B = z.shape[0]
+        t_batch = t.expand(B)
+        if self.cfg_scale == 1.0:
+            return self.model.forward_flow(t_batch, z, self.context)
+        else:
+            return self.model.forward_flow_with_cfg(
+                t_batch, z, self.context, self.cfg_scale)
+
+@torch.no_grad()
+def stochastic_euler_sample(model, x0, context, T, cfg_scale=1.0):
+    z = x0
+    B = z.shape[0]
+    for i in range(T):
+        tt = i / T
+        t_batch = torch.full((B,), tt, device=z.device)
+        if cfg_scale == 1.0:
+            v_pred = model.forward_flow(t_batch, z, context)
+        else:
+            v_pred = model.forward_flow_with_cfg(t_batch, z, context, cfg_scale)
+        alpha = 1 + tt * (1 - tt)
+        sigma = 0.2 * (tt * (1 - tt)) ** 0.5
+        z = z + (alpha * v_pred + sigma * torch.randn_like(z)) / T
+    return z
 
 
 def load_vae(vae_ckpt_path, device):
@@ -59,40 +94,47 @@ def load_vae(vae_ckpt_path, device):
 
 
 def load_stage2_model(stage2_ckpt_path, model_cfg, device):
-    """Load BrainMaskedDiT model."""
-    config = BrainMaskedDiTConfig(**model_cfg)
-    model = BrainMaskedDiT(config).to(device)
+    """Load BrainCondFlow model."""
+    config = BrainCondFlowConfig(**model_cfg)
+    model = BrainCondFlow(config).to(device)
 
     ckpt = torch.load(stage2_ckpt_path, map_location='cpu')
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"BrainMaskedDiT loaded: {stage2_ckpt_path}")
+    print(f"BrainCondFlow loaded: {stage2_ckpt_path}")
     return model
 
 
-def generate_fmri(model, vae, dino_features, device):
+def generate_fmri(model, vae, dino_features, device, cfg_scale=1.0, sampler="ode", ode_steps=50):
     """
     Generate synthetic fMRI from DINOv2 features.
     
     Args:
-        model: BrainMaskedDiT model
-        vae: FmriViTVAE model
-        dino_features: np.ndarray (4, 257, 768) for a single sample
+        model: BrainCondFlow model
+        vae: fmri VAE model
+        dino_features: np.ndarray for a single sample
         device: torch device
+        cfg_scale: float
+        sampler: str ("ode" or "stochastic_euler")
+        ode_steps: int
     
     Returns:
         fmri_pred: np.ndarray (15724,)
     """
     with torch.no_grad():
-        dino_tensor = torch.from_numpy(dino_features).float().unsqueeze(0).to(device)  # (1, 4, 257, 768)
+        dino_tensor = torch.from_numpy(dino_features).float().unsqueeze(0).to(device)
         
-        # Create dummy z_t (will be fully masked, so content doesn't matter)
         latent_dim = model.config.latent_dim
-        dummy_z = torch.zeros(1, latent_dim, device=device)
+        x0 = torch.randn(1, latent_dim, device=device)
         
-        # Generate latent with full masking (mask_ratio=1.0)
-        z_pred, _ = model(dummy_z, dino_tensor, mask_ratio=1.0)
-        
+        if sampler == "stochastic_euler":
+            z_pred = stochastic_euler_sample(model, x0, dino_tensor, T=ode_steps, cfg_scale=cfg_scale)
+        else:
+            ode_fn = CondFlowODEWrapper(model, dino_tensor, cfg_scale)
+            t_span = torch.linspace(0, 1, ode_steps, device=device)
+            traj = odeint(ode_fn, x0, t_span, method="midpoint")
+            z_pred = traj[-1]
+            
         # Decode latent → fMRI
         fmri_pred = vae.decode(z_pred)
         
@@ -106,10 +148,10 @@ def main():
     parser.add_argument("--json_file", type=str, default=None,
                         help="Path to JSON file with list of {test_index, captions}")
     parser.add_argument("--stage2_config", type=str,
-                        default="results/subj01/stage2_masked_vit_vae/config.yaml")
+                        default="src/configs/subj01/stage2_cond_ot_flow_fnp_v2.yaml")
     parser.add_argument("--stage2_ckpt", type=str,
-                        default="results/subj01/stage2_masked_vit_vae/best.pt")
-    parser.add_argument("--output_dir", type=str, default="Data/evals/stage2_infer")
+                        default="results/subj01/stage_2_flownp/best_model.pt")
+    parser.add_argument("--output_dir", type=str, default="results/subj01/stage_2_flownp")
     parser.add_argument("--cache_dir", type=str, default="Data/checkpoints",
                         help="MindEye2 checkpoint directory")
     parser.add_argument("--img2img_strength", type=int, default=13)
@@ -144,6 +186,10 @@ def main():
 
     data_cfg = stage2_cfg["data"]
     model_cfg = stage2_cfg.get("model", {})
+    train_cfg = stage2_cfg.get("training", {})
+    sampler = train_cfg.get("sampler", "ode")
+    ode_steps = train_cfg.get("ode_steps", 50)
+    cfg_scale_model = train_cfg.get("cfg_scale", 1.0)
 
     # ---- Load models (only if NOT using nii_dir) ----
     if not args.nii_dir:
@@ -199,7 +245,7 @@ def main():
             print(f"  [{test_idx}] Loaded fMRI from {nii_path}: shape={fmri_pred.shape}")
         else:
             dino_feat = np.array(dino_mmap[test_idx])
-            fmri_pred = generate_fmri(model, vae, dino_feat, device)
+            fmri_pred = generate_fmri(model, vae, dino_feat, device, cfg_scale=cfg_scale_model, sampler=sampler, ode_steps=ode_steps)
             print(f"  [{test_idx}] fMRI generated: shape={fmri_pred.shape}, "
                   f"range=[{fmri_pred.min():.3f}, {fmri_pred.max():.3f}]")
                   
@@ -262,15 +308,14 @@ def main():
             caption = recon_results['captions'][i] if recon_results['captions'] and len(recon_results['captions']) > i else all_captions[i]
             if caption is None: caption = ""
 
-            # Col 1: Original test image
+            # Col 1: Original test image (use test_index)
             orig_path = os.path.join(test_img_dir, f"{test_idx}.png")
             if os.path.exists(orig_path):
                 orig_img = Image.open(orig_path)
             else:
                 orig_img = Image.new('RGB', (425, 425), (200, 200, 200))
 
-            display_id = sample.get("eval_image", f"Test #{test_idx}")
-            if display_id.endswith(".png"): display_id = display_id[:-4]
+            display_id = f"Test #{test_idx}"
 
             axes[i][0].imshow(orig_img)
             axes[i][0].set_title(
