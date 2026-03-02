@@ -12,7 +12,7 @@ set -e
 if [ $# -gt 0 ]; then
     SUBJECTS=("$@")
 else
-    SUBJECTS=(01 02 05 07)
+    SUBJECTS=(02 05 07)
 fi
 
 CONFIG_DIR="src/configs"
@@ -25,10 +25,10 @@ echo "=========================================="
 for sub in "${SUBJECTS[@]}"; do
     echo ""
     echo "=========================================="
-    echo " Subject ${sub} — Stage 2: XAttn Flow (noise-robust)"
+    echo " Subject ${sub} — Stage 2: Direct Cond OT Flow (FlowNP v2)"
     echo "=========================================="
-    python -m src.train_stage2_xattn_flow \
-        --config ${CONFIG_DIR}/subj${sub}/stage2_xattn_flow_vit_vae.yaml
+    python -m src.train_stage2_cond_ot_flow \
+        --config ${CONFIG_DIR}/subj${sub}/stage2_cond_ot_flow_fnp_v2.yaml
     if [ $? -ne 0 ]; then
         echo "ERROR: Stage 2 failed for subj${sub}!"
         exit 1

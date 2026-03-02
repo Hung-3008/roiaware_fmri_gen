@@ -1,0 +1,61 @@
+# Stage 2: Direct Conditional OT Flow Matching — Subject 02 (ViT VAE)
+# FlowNP-style TransformerEncoder — Improved v2
+# Changes: no context masking, larger model, ODE solver, cfg_scale=1.0
+
+data:
+  root: "Data/nsd"
+  subject: "subj02"
+  vae_checkpoint: "results/subj02/stage1_vit_vae/best.pt"
+  roi_dir: "Data/nsddata/ppdata/subj02/func1pt8mm/roi"
+  dino_suffix: "dinov2_vitb14_multilayer"
+
+dino_layers: [3, 6, 9, 12]
+
+model:
+  latent_dim: 768
+  n_latent_tokens: 24
+  context_dim: 768
+  n_dino_layers: 4
+  n_context_queries: 257
+
+  # FlowNP-style backbone — larger capacity
+  backbone: "transformer"
+  flow_hidden_dim: 512
+  flow_depth: 8
+  flow_num_heads: 8
+  
+  # Shared
+  mlp_ratio: 4.0
+  dropout: 0.1
+  drop_path_rate: 0.0
+
+training:
+  num_epochs: 300
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 0.05
+  grad_clip: 1.0
+  warmup_epochs: 20
+  use_ema: true
+  ema_decay: 0.999
+  
+  # Inference — ODE solver (more accurate than stochastic Euler)
+  sampler: "ode"
+  cfg_drop_prob: 0.0
+  cfg_scale: 1.0
+  ode_steps: 50
+  num_trials: 1
+  
+  # Flow details — no context masking
+  use_ot: true
+  sigma: 0.01
+  context_mask_ratio: 0.0
+  timestep_sampling: "logit_normal"
+  logit_normal_mu: 0.0
+  logit_normal_sigma: 0.7
+  
+  patience: 0
+  save_every: 50
+  eval_interval: 5
+
+output_dir: "results/subj02/stage2_cond_ot_flow_fnp_v2"
