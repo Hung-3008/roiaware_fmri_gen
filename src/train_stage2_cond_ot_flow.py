@@ -36,6 +36,7 @@ from torchcfm.conditional_flow_matching import (
 from src.model.brain_cond_flow import BrainCondFlow, BrainCondFlowConfig
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
 from src.model.fmri_vit_vae import FmriViTVAE, create_fmri_vit_vae
+from src.model.fmri_roi_vae import FmriROIVAE, create_fmri_roi_vae
 from src.utils.roi_utils import ROIDecomposer
 
 
@@ -116,6 +117,84 @@ def cosine_lr(optimizer, epoch, total, warmup, base_lr, min_lr=1e-6):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
     return lr
+
+
+# ─── Velocity Loss Functions ─────────────────────────────────────────────────
+
+
+def compute_velocity_loss(v_pred, ut, t=None, loss_type="mse",
+                          huber_c=0.1,
+                          timestep_weight_type="none",
+                          direction_weight=1.0,
+                          magnitude_weight=0.1):
+    """
+    Compute velocity matching loss with multiple strategies.
+
+    Args:
+        v_pred: (B, D) predicted velocity
+        ut: (B, D) target velocity
+        t: (B,) timestep values, needed for timestep weighting
+        loss_type: "mse" | "pseudo_huber" | "decoupled"
+        huber_c: threshold for Pseudo-Huber transition from L2 to L1
+        timestep_weight_type: "none" | "linear" | "cosine" | "snr"
+        direction_weight: weight for cosine direction loss (decoupled)
+        magnitude_weight: weight for magnitude loss (decoupled)
+
+    Returns:
+        loss: scalar loss value
+        loss_info: dict with component values for logging
+    """
+    info = {}
+
+    if loss_type == "pseudo_huber":
+        # Pseudo-Huber: sqrt((v-u)^2 + c^2) - c
+        # Behaves like MSE near 0, like L1 for large errors
+        diff_sq = (v_pred - ut).pow(2)
+        per_element = (diff_sq + huber_c ** 2).sqrt() - huber_c
+        raw_loss = per_element.mean(dim=-1)  # (B,)
+        info["huber_raw"] = raw_loss.mean().item()
+
+    elif loss_type == "decoupled":
+        # Separate direction and magnitude learning
+        # Direction: cosine similarity loss
+        cos_sim = F.cosine_similarity(v_pred, ut, dim=-1)  # (B,)
+        dir_loss = 1.0 - cos_sim  # (B,)
+
+        # Magnitude: log-ratio loss (scale-invariant)
+        pred_mag = v_pred.norm(dim=-1).clamp(min=1e-6)  # (B,)
+        tgt_mag = ut.norm(dim=-1).clamp(min=1e-6)       # (B,)
+        mag_loss = (pred_mag.log() - tgt_mag.log()).pow(2)  # (B,)
+
+        raw_loss = direction_weight * dir_loss + magnitude_weight * mag_loss
+        info["dir_loss"] = dir_loss.mean().item()
+        info["mag_loss"] = mag_loss.mean().item()
+        info["v_cos"] = cos_sim.mean().item()
+
+    else:  # "mse" (default)
+        raw_loss = (v_pred - ut).pow(2).mean(dim=-1)  # (B,)
+
+    # ─── Timestep weighting ───
+    if t is not None and timestep_weight_type != "none":
+        if timestep_weight_type == "linear":
+            # w(t) = 1 - t:  full weight at t=0, zero at t=1
+            w = 1.0 - t
+        elif timestep_weight_type == "cosine":
+            # w(t) = cos(π*t/2)²: smooth decay
+            w = torch.cos(t * 3.14159 / 2).pow(2)
+        elif timestep_weight_type == "snr":
+            # w(t) = 1/(1 + t/(1-t+ε)): SNR-inspired weighting
+            w = 1.0 / (1.0 + t / (1.0 - t + 1e-4))
+        else:
+            w = torch.ones_like(t)
+
+        w = w / (w.mean() + 1e-8)  # normalize so mean weight ≈ 1
+        loss = (w * raw_loss).mean()
+        info["w_mean"] = w.mean().item()
+        info["w_std"] = w.std().item()
+    else:
+        loss = raw_loss.mean()
+
+    return loss, info
 
 
 # ─── ODE Wrapper ─────────────────────────────────────────────────────────────
@@ -296,6 +375,13 @@ def main():
     logit_normal_mu = train_cfg.get("logit_normal_mu", 0.0)
     logit_normal_sigma = train_cfg.get("logit_normal_sigma", 1.0)
 
+    # Loss options
+    velocity_loss_type = train_cfg.get("velocity_loss_type", "mse")
+    huber_c = train_cfg.get("huber_c", 0.1)
+    timestep_weight_type = train_cfg.get("timestep_weight_type", "none")
+    direction_weight = train_cfg.get("direction_weight", 1.0)
+    magnitude_weight = train_cfg.get("magnitude_weight", 0.1)
+
     output_dir = cfg.get("output_dir", "results/stage2_cond_ot_flow")
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "config.yaml"), "w") as f:
@@ -368,7 +454,10 @@ def main():
     with open(config_path) as f:
         vae_cfg = yaml.safe_load(f)
     vae_model_type = vae_cfg.get("model_type", "mlp")
-    if vae_model_type == "vit":
+    if vae_model_type == "roi":
+        vae = create_fmri_roi_vae(**vae_cfg["model"]).to(device).eval()
+        logger.info("VAE type: ROI")
+    elif vae_model_type == "vit":
         vae = create_fmri_vit_vae(**vae_cfg["model"]).to(device).eval()
         logger.info("VAE type: ViT")
     else:
@@ -443,6 +532,11 @@ def main():
         f"Training {num_epochs} epochs, eval every {eval_interval} | {ts_info}")
     logger.info(
         f"DIRECT COND FLOW | OT={use_ot} ContextMask={context_mask_ratio} Sampler={sampler}")
+    logger.info(
+        f"LOSS: type={velocity_loss_type} | t_weight={timestep_weight_type}"
+        + (f" | huber_c={huber_c}" if velocity_loss_type == "pseudo_huber" else "")
+        + (f" | dir_w={direction_weight} mag_w={magnitude_weight}" if velocity_loss_type == "decoupled" else "")
+    )
 
     for epoch in range(1, num_epochs + 1):
         model.train()
@@ -488,7 +582,14 @@ def main():
             v_pred = model.forward_flow(t, xt, context, mask_ratio=context_mask_ratio)
 
             # ─── Loss: Velocity Matching ─────────────────────────
-            loss = F.mse_loss(v_pred, ut)
+            loss, loss_info = compute_velocity_loss(
+                v_pred, ut, t=t,
+                loss_type=velocity_loss_type,
+                huber_c=huber_c,
+                timestep_weight_type=timestep_weight_type,
+                direction_weight=direction_weight,
+                magnitude_weight=magnitude_weight,
+            )
 
             optimizer.zero_grad()
             loss.backward()

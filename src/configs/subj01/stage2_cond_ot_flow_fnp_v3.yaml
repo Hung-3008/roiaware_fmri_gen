@@ -1,0 +1,57 @@
+data:
+  dino_suffix: dinov2_vitb14_multilayer
+  roi_dir: Data/nsddata/ppdata/subj01/func1pt8mm/roi
+  root: Data/nsd
+  subject: subj01
+  vae_checkpoint: results/subj01/stage1_vit_vae/best.pt
+
+dino_layers:
+- 3
+- 6
+- 9
+- 12
+
+model:
+  backbone: transformer
+  context_dim: 768
+  drop_path_rate: 0.1          # Stochastic depth for regularization (was 0.0)
+  dropout: 0.15                # Increased dropout (was 0.1)
+  flow_depth: 6                # Reduced depth to combat overfitting (was 8)
+  flow_hidden_dim: 512
+  flow_num_heads: 8
+  latent_dim: 768
+  mlp_ratio: 4.0
+  n_context_queries: 257
+  n_dino_layers: 4
+  n_latent_tokens: 24
+
+output_dir: results/subj01/stage2_cond_ot_flow_fnp_v3
+
+training:
+  batch_size: 128
+  cfg_drop_prob: 0.15          # CRITICAL: Enable CFG training (was 0.0)
+  cfg_scale: 1.0               # Keep 1.0 during training; adjust at inference
+  context_mask_ratio: 0.15     # Mask context tokens for regularization (was 0.0)
+  ema_decay: 0.999
+  eval_interval: 3             # More frequent eval for finer early stopping (was 5)
+  grad_clip: 1.0
+  logit_normal_mu: 0.0
+  logit_normal_sigma: 1.0      # Broader timestep sampling (was 0.7)
+  lr: 0.0003
+  num_epochs: 500              # More room with early stopping guard (was 300)
+  num_trials: 1
+  ode_steps: 50
+  patience: 40                 # Early stopping after 40 eval cycles (was 0)
+  sampler: ode
+  save_every: 50
+  sigma: 0.05                  # More path noise for smoother flow (was 0.01)
+  timestep_sampling: logit_normal
+  use_ema: true
+  use_ot: true
+  warmup_epochs: 20
+  weight_decay: 0.08           # Stronger L2 regularization (was 0.05)
+
+  # Velocity loss options (NEW)
+  velocity_loss_type: pseudo_huber  # "mse" | "pseudo_huber" | "decoupled"
+  huber_c: 0.1                     # Pseudo-Huber threshold
+  timestep_weight_type: cosine     # "none" | "linear" | "cosine" | "snr"

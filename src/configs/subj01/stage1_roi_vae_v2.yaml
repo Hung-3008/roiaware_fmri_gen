@@ -1,0 +1,42 @@
+# fMRI ROI-level VAE v2 — Stage 1 (Subject 01)
+# Optimized for faster convergence: larger ROI MLPs, multi-token, PCC loss
+
+model_type: "roi"
+
+data:
+  root: "Data/nsd"
+  subject: "subj01"
+  train_rep_mode: "single_trial"
+  test_rep_mode: "average"
+
+model:
+  roi_dir: "Data/nsddata/ppdata/subj01/func1pt8mm/roi"
+  embed_dim: 512
+  depth: 4
+  heads: 8
+  mlp_ratio: 4.0
+  latent_dim: 768
+  dropout: 0.1
+  roi_mlp_hidden: 1024           # 512 → 1024: reduce compression ratio for large ROIs
+  roi_mlp_layers: 3              # 2 → 3: more capacity to learn complex voxel patterns
+  large_roi_threshold: 1500      # 3000 → 1500: more ROIs get multiple tokens
+                                 # other(4673)→3 tokens, body(2495)→1, place(2091)→1
+
+loss:
+  beta_max: 0.0001
+  beta_anneal_epochs: 50
+  lambda_pcc: 0.5                # 0.0 → 0.5: enable PCC loss to directly optimize correlation
+
+training:
+  epochs: 200
+  lr: 3.0e-4                     # 2e-4 → 3e-4: slightly higher LR for faster convergence
+  weight_decay: 0.03
+  batch_size: 128
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 4
+  save_dir: "results/subj01/stage1_roi_vae_v2"
+  log_interval: 50
+  val_interval: 1
+  use_amp: true
+  early_stopping_patience: 30

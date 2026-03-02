@@ -25,6 +25,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 
 from src.model.fmri_mlp_vae import FmriMLPVAE, create_fmri_mlp_vae
 from src.model.fmri_vit_vae import FmriViTVAE, create_fmri_vit_vae
+from src.model.fmri_roi_vae import FmriROIVAE, create_fmri_roi_vae
 from src.utils.metrics import pearson_correlation
 from src.utils.training import (
     EarlyStopping, CosineAnnealingWithWarmup,
@@ -267,7 +268,10 @@ def main():
     model_cfg = cfg["model"]
     model_type = cfg.get("model_type", "mlp")
 
-    if model_type == "vit":
+    if model_type == "roi":
+        model = create_fmri_roi_vae(**model_cfg).to(device)
+        model_name = "FmriROIVAE"
+    elif model_type == "vit":
         model = create_fmri_vit_vae(**model_cfg).to(device)
         model_name = "FmriViTVAE"
     else:

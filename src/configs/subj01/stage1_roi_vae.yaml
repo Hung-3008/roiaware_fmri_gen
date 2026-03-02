@@ -1,0 +1,41 @@
+# fMRI ROI-level VAE — Stage 1 (Subject 01)
+# ROI Architecture: Per-ROI MLP + Transformer cross-ROI attention
+
+model_type: "roi"
+
+data:
+  root: "Data/nsd"
+  subject: "subj01"
+  train_rep_mode: "single_trial"
+  test_rep_mode: "average"
+
+model:
+  roi_dir: "Data/nsddata/ppdata/subj01/func1pt8mm/roi"
+  embed_dim: 512
+  depth: 4               # 4 layers sufficient for ~10 tokens
+  heads: 8
+  mlp_ratio: 4.0
+  latent_dim: 768
+  dropout: 0.1
+  roi_mlp_hidden: 512    # Hidden dim for per-ROI MLPs
+  roi_mlp_layers: 2      # 2 hidden layers in per-ROI MLPs
+  large_roi_threshold: 3000  # ROIs with >3000 voxels get extra tokens
+
+loss:
+  beta_max: 0.0001
+  beta_anneal_epochs: 50
+  lambda_pcc: 0.0
+
+training:
+  epochs: 150
+  lr: 2.0e-4
+  weight_decay: 0.03
+  batch_size: 128
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 4
+  save_dir: "results/subj01/stage1_roi_vae"
+  log_interval: 50
+  val_interval: 1
+  use_amp: true
+  early_stopping_patience: 30
