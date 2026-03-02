@@ -53,5 +53,5 @@ training:
 
   # Velocity loss options (NEW)
   velocity_loss_type: pseudo_huber  # "mse" | "pseudo_huber" | "decoupled"
-  huber_c: 0.1                     # Pseudo-Huber threshold
-  timestep_weight_type: cosine     # "none" | "linear" | "cosine" | "snr"
+  huber_c: 0.1                      # Pseudo-Huber threshold
+  timestep_weight_type: cosine      # "none" | "linear" | "cosine" | "snr"

@@ -145,6 +145,7 @@ def load_fmri_inputs(fmri_npy=None, nii_dir=None, fmri_data=None):
             basename = os.path.basename(gt_file)
             sample_id = basename.split("_gt.nii")[0]
             pred_file = os.path.join(nii_dir, basename.replace('_gt.', '_pred.'))
+            mean_pred_file = os.path.join(nii_dir, basename.replace('_gt.', '_mean_pred.'))
 
             # Load GT
             gt_data = nib.load(gt_file).get_fdata().flatten().astype(np.float32)
@@ -158,6 +159,11 @@ def load_fmri_inputs(fmri_npy=None, nii_dir=None, fmri_data=None):
                 pred_data = _pad_or_truncate(pred_data, NUM_VOXELS)
                 samples.append(pred_data)
                 labels.append(f"{sample_id}_pred")
+            elif os.path.exists(mean_pred_file):
+                pred_data = nib.load(mean_pred_file).get_fdata().flatten().astype(np.float32)
+                pred_data = _pad_or_truncate(pred_data, NUM_VOXELS)
+                samples.append(pred_data)
+                labels.append(f"{sample_id}_mean_pred")
 
         return samples, labels
 
@@ -440,11 +446,12 @@ def run_stage3(raw_images, captions, cache_dir, device, img2img_strength=13, cfg
     def denoiser(x, sigma, c):
         return base_engine.denoiser(base_engine.model, x, sigma, c)
 
-    base_engine.sampler.num_steps = 25
-    base_engine.sampler.guider.scale = cfg_scale
     img2img_timepoint = img2img_strength
 
     def enhance_img(raw_img_np, prompt):
+        base_engine.sampler.num_steps = 25
+        base_engine.sampler.guider.scale = cfg_scale
+
         raw_img = torch.tensor(raw_img_np).permute(2, 0, 1).unsqueeze(0).to(device)
         raw_img = transforms.Resize((768, 768))(raw_img).float()
 
@@ -481,7 +488,7 @@ def run_stage3(raw_images, captions, cache_dir, device, img2img_strength=13, cfg
         return transforms.Resize((224, 224))(samples[0]).cpu().permute(1, 2, 0).numpy()
 
     enhanced_images = []
-    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16), base_engine.ema_scope():
         for i in tqdm(range(len(raw_images)), desc="Stage 3"):
             enh = enhance_img(raw_images[i], captions[i])
             enhanced_images.append(enh)
