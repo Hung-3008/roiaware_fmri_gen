@@ -40,6 +40,7 @@ from src.model.brain_flow_v2 import (
     BrainFlowV2, BrainFlowV2Config, timestep_embedding, modulate,
 )
 from src.utils.roi_utils import ROIDecomposer, build_roi_perm
+from src.utils.roi_pca import ROIPCATransform
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -56,7 +57,7 @@ class FmriImageDataset(Dataset):
 
     def __init__(self, fmri_path, stim_path, image_dir,
                  split="train", image_size=224, max_samples=0,
-                 use_single_trials=False):
+                 use_single_trials=False, pca_transform=None):
         print(f"\nFmriImageDataset [{split}]: Loading...")
 
         # Load fMRI
@@ -67,7 +68,6 @@ class FmriImageDataset(Dataset):
             fmri = raw_fmri.reshape(N * R, V).astype(np.float32)
             # Also store avg fMRI (N, V) for per-ROI soft target
             fmri_avg = raw_fmri.mean(axis=1).astype(np.float32)  # (N, V)
-            self.fmri_avg = fmri_avg
             # Map each trial back to its original image index
             self.img_indices = np.repeat(np.arange(N), R)
             self.has_avg = True
@@ -75,18 +75,26 @@ class FmriImageDataset(Dataset):
             print(f"  Also loaded avg fMRI: {fmri_avg.shape}")
         elif raw_fmri.ndim == 3:
             fmri = raw_fmri.mean(axis=1).astype(np.float32)
-            self.fmri_avg = fmri   # avg IS the fmri in this case
+            fmri_avg = fmri   # avg IS the fmri in this case
             self.img_indices = None
             self.has_avg = False
         elif raw_fmri.ndim == 2:
             fmri = raw_fmri.astype(np.float32)
-            self.fmri_avg = fmri
+            fmri_avg = fmri
             self.img_indices = None
             self.has_avg = False
         else:
             raise ValueError(f"Unexpected fMRI shape: {raw_fmri.shape}")
         del raw_fmri
+
+        # Apply Per-ROI PCA if provided
+        if pca_transform is not None:
+            print(f"  Applying PCA: {fmri.shape[1]} → {pca_transform.total_dims}")
+            fmri = pca_transform.transform(fmri)
+            fmri_avg = pca_transform.transform(fmri_avg)
+
         self.fmri = fmri
+        self.fmri_avg = fmri_avg
 
         # Determine image loading mode
         self.image_dir = image_dir
@@ -305,7 +313,7 @@ def stochastic_euler_sample(model, x0, image, T, cfg_scale=1.0):
 @torch.no_grad()
 def validate(model, val_loader, fm, device, ode_steps=50,
              cfg_scale=1.0, num_trials=1, decomposer=None,
-             sampler="ode"):
+             sampler="ode", pca_transform=None):
     """Validate BrainFlowV2 — generate fMRI directly from images."""
     if sampler == "ode":
         from torchdiffeq import odeint
@@ -356,20 +364,30 @@ def validate(model, val_loader, fm, device, ode_steps=50,
     preds = torch.cat(all_pred)
     trues = torch.cat(all_true)
 
+    # Metrics in model space (PCA space if PCA is on)
     metrics = {
         "val_flow_loss": total_flow_loss / max(n_batches, 1),
         "val_v_cos": sum(all_v_cos) / len(all_v_cos),
-        "val_fmri_mse": F.mse_loss(preds, trues).item(),
-        "val_fmri_pcc": pearson_corr_voxelwise(preds, trues),
-        "val_fmri_spcc": pearson_corr_samplewise(preds, trues),
     }
 
-    # Per-ROI metrics
+    # If PCA is active, inverse transform → compute metrics in voxel space
+    if pca_transform is not None:
+        preds_vox = pca_transform.inverse_transform_torch(preds)
+        trues_vox = pca_transform.inverse_transform_torch(trues)
+    else:
+        preds_vox = preds
+        trues_vox = trues
+
+    metrics["val_fmri_mse"] = F.mse_loss(preds_vox, trues_vox).item()
+    metrics["val_fmri_pcc"] = pearson_corr_voxelwise(preds_vox, trues_vox)
+    metrics["val_fmri_spcc"] = pearson_corr_samplewise(preds_vox, trues_vox)
+
+    # Per-ROI metrics (always in voxel space)
     if decomposer is not None:
         for roi in decomposer.rois:
             if roi.n_voxels > 10:
-                p = preds[:, roi.indices]
-                t_roi = trues[:, roi.indices]
+                p = preds_vox[:, roi.indices]
+                t_roi = trues_vox[:, roi.indices]
                 metrics[f"roi_{roi.name}_spcc"] = (
                     pearson_corr_samplewise(p, t_roi))
             else:
@@ -481,22 +499,100 @@ def main():
     roi_names = decomposer.get_roi_names()
     logger.info(f"\n{decomposer.summary()}")
 
-    # ── ROI-Sort Permutation (for ROI-aware patching) ──
-    # Build once from ROIDecomposer; inject into model config automatically.
-    # Set use_roi_pos_embed: false in config.yaml to disable.
-    if model_cfg.get("use_roi_pos_embed", True):
-        patch_size = model_cfg.get("patch_size", 124)
-        n_voxels = model_cfg.get("n_voxels", 15724)
-        voxel_perm, patch_roi_ids = build_roi_perm(
-            decomposer, patch_size, n_voxels)
-        model_cfg["voxel_perm"] = voxel_perm.tolist()
-        model_cfg["patch_roi_ids"] = patch_roi_ids.tolist()
+    # ── Per-ROI PCA ──
+    pca_cfg = cfg.get("pca", {})
+    use_pca = pca_cfg.get("enabled", False)
+    pca_transform = None  # will be set below if enabled
+
+    if use_pca:
+        pca_variance = pca_cfg.get("variance_ratio", 0.95)
+        pca_n_comp = pca_cfg.get("n_components", {})
+        # Load raw training fMRI to fit PCA
+        subject = data_cfg.get("subject", "subj01")
+        sub_num = int(subject.replace("subj", "").lstrip("0"))
+        root = data_cfg["root"]
+        _train_fmri_path = os.path.join(
+            root, subject, f"nsd_train_fmri_zscore_sub{sub_num}.npy")
+        logger.info(f"Fitting Per-ROI PCA (variance={pca_variance})...")
+        _raw = np.load(_train_fmri_path)
+        if _raw.ndim == 3:
+            # Use averaged fMRI for PCA fitting (more stable than single trials)
+            _fit_data = _raw.mean(axis=1).astype(np.float32)
+        else:
+            _fit_data = _raw.astype(np.float32)
+        if args.debug:
+            _fit_data = _fit_data[:128]
+        del _raw
+
+        pca_transform = ROIPCATransform(
+            decomposer,
+            variance_ratio=pca_variance,
+            n_components_per_roi=pca_n_comp if pca_n_comp else None,
+        )
+        pca_transform.fit(_fit_data)
+        del _fit_data
+
+        logger.info(f"\n{pca_transform.summary()}")
+
+        # Sanity check: reconstruction error on first few samples
+        _check = np.load(_train_fmri_path, mmap_mode='r')
+        if _check.ndim == 3:
+            _check_data = _check[:5].mean(axis=1).astype(np.float32)
+        else:
+            _check_data = _check[:5].astype(np.float32)
+        _recon = pca_transform.inverse_transform(
+            pca_transform.transform(_check_data))
+        _recon_mse = np.mean((_check_data - _recon) ** 2)
+        logger.info(f"PCA reconstruction MSE (5 samples): {_recon_mse:.6f}")
+        del _check, _check_data, _recon
+
+        # Override model config with PCA dimensions
+        pca_total = pca_transform.total_dims
+        # Auto-compute patch_size: find a divisor close to original
+        _orig_ps = model_cfg.get("patch_size", 124)
+        # Try to find a good patch_size that divides pca_total
+        _best_ps = _orig_ps
+        _best_rem = pca_total % _orig_ps
+        for _ps in range(max(32, _orig_ps - 40),
+                         min(pca_total // 4, _orig_ps + 40) + 1):
+            if pca_total % _ps == 0:
+                _best_ps = _ps
+                _best_rem = 0
+                break
+            if pca_total % _ps < _best_rem:
+                _best_ps = _ps
+                _best_rem = pca_total % _ps
+
+        model_cfg["n_voxels"] = pca_total
+        model_cfg["patch_size"] = _best_ps
+        # PCA output is already ROI-sorted, no voxel_perm needed
+        model_cfg["voxel_perm"] = None
+        # Compute patch_roi_ids from PCA dims
+        model_cfg["patch_roi_ids"] = pca_transform.get_patch_roi_ids(_best_ps)
         model_cfg["use_roi_pos_embed"] = True
         logger.info(
-            f"ROI-sort: built voxel_perm ({len(voxel_perm)} voxels), "
-            f"patch_roi_ids ({len(patch_roi_ids)} patches)")
+            f"PCA → model: n_voxels={pca_total}, patch_size={_best_ps}, "
+            f"pad={pca_total % _best_ps}, "
+            f"patches={len(model_cfg['patch_roi_ids'])}")
+
+        # Save PCA transform
+        pca_transform.save(os.path.join(output_dir, "roi_pca.pkl"))
+        logger.info(f"Saved PCA transform to {output_dir}/roi_pca.pkl")
     else:
-        logger.info("ROI-sort: disabled (use_roi_pos_embed=false)")
+        # ── ROI-Sort Permutation (for ROI-aware patching) ──
+        if model_cfg.get("use_roi_pos_embed", True):
+            patch_size = model_cfg.get("patch_size", 124)
+            n_voxels = model_cfg.get("n_voxels", 15724)
+            voxel_perm, patch_roi_ids = build_roi_perm(
+                decomposer, patch_size, n_voxels)
+            model_cfg["voxel_perm"] = voxel_perm.tolist()
+            model_cfg["patch_roi_ids"] = patch_roi_ids.tolist()
+            model_cfg["use_roi_pos_embed"] = True
+            logger.info(
+                f"ROI-sort: built voxel_perm ({len(voxel_perm)} voxels), "
+                f"patch_roi_ids ({len(patch_roi_ids)} patches)")
+        else:
+            logger.info("ROI-sort: disabled (use_roi_pos_embed=false)")
 
     # ── Per-ROI soft alpha list (ordered by decomposer.rois) ──
     # roi_soft_alphas[i] = alpha for decomposer.rois[i]
@@ -533,12 +629,13 @@ def main():
     train_ds = FmriImageDataset(
         train_fmri, train_stim, train_img_dir,
         split="train", image_size=image_size, max_samples=debug_n,
-        use_single_trials=use_single_trials)
+        use_single_trials=use_single_trials, pca_transform=pca_transform)
     val_ds = FmriImageDataset(
         val_fmri, val_stim, val_img_dir,
         split="test", image_size=image_size,
         max_samples=debug_n // 4 if args.debug else 0,
-        use_single_trials=False)  # val always averaged for fair comparison
+        use_single_trials=False,  # val always averaged for fair comparison
+        pca_transform=pca_transform)
 
     if args.debug:
         batch_size = min(batch_size, 16)
@@ -650,12 +747,19 @@ def main():
            if velocity_loss_type == "pseudo_huber" else ""))
 
     # Precompute ROI index tensors on device (once) for per-ROI soft target
-    # Avoids creating a new tensor every batch inside the training loop
+    # With PCA: use PCA dim ranges; without PCA: use voxel indices
     if use_per_roi_soft:
-        roi_index_tensors = [
-            torch.tensor(roi.indices, dtype=torch.long, device=device)
-            for roi in decomposer.rois
-        ]
+        if use_pca and pca_transform is not None:
+            # PCA dim ranges: each ROI's PCs are contiguous
+            roi_index_tensors = [
+                t.to(device)
+                for t in pca_transform.get_roi_dim_ranges()
+            ]
+        else:
+            roi_index_tensors = [
+                torch.tensor(roi.indices, dtype=torch.long, device=device)
+                for roi in decomposer.rois
+            ]
     else:
         roi_index_tensors = None
 
@@ -808,7 +912,8 @@ def main():
             eval_model = ema_model if use_ema else model
             val = validate(eval_model, val_loader, fm, device,
                            ode_steps, cfg_scale, num_trials,
-                           decomposer=decomposer, sampler=sampler)
+                           decomposer=decomposer, sampler=sampler,
+                           pca_transform=pca_transform)
 
             row = {
                 "epoch": epoch,
