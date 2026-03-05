@@ -178,3 +178,56 @@ class ROIDecomposer:
                 f"  {roi.name:20s}: {roi.n_voxels:5d} voxels "
                 f"({pct:5.1f}%) [{roi.hierarchy}]")
         return "\n".join(lines)
+
+
+# ─── ROI-Sort Utilities ───────────────────────────────────────────────────────
+
+
+def build_roi_perm(decomposer: ROIDecomposer, patch_size: int, n_voxels: int):
+    """
+    Build permutation indices for ROI-sorted fMRI voxels and per-patch ROI labels.
+
+    Rearranges the flat fMRI vector so that voxels in the same ROI are
+    contiguous. After patchification, each patch will contain voxels
+    predominantly from a single ROI, giving the model meaningful positional
+    structure.
+
+    Args:
+        decomposer: ROIDecomposer with .assignments array (shape n_voxels,)
+        patch_size: number of voxels per patch (e.g. 124)
+        n_voxels: total number of voxels (e.g. 15724)
+
+    Returns:
+        voxel_perm:    np.ndarray int64 (n_voxels,) — permutation index
+        patch_roi_ids: np.ndarray int64 (num_patches,) — dominant ROI per patch
+    """
+    # Build permutation: concatenate voxel indices grouped by ROI in order
+    roi_order = [roi.indices for roi in decomposer.rois]
+    perm = np.concatenate(roi_order).astype(np.int64)   # (n_voxels,)
+    assert len(perm) == n_voxels, \
+        f"Permutation length {len(perm)} != n_voxels {n_voxels}"
+
+    # Build per-voxel ROI assignment in the NEW (sorted) order
+    voxel_roi_sorted = decomposer.assignments[perm]  # (n_voxels,)
+
+    # Pad to multiple of patch_size
+    padded = ((n_voxels + patch_size - 1) // patch_size) * patch_size
+    pad_len = padded - n_voxels
+    if pad_len > 0:
+        # Pad with label 8 ("other") for the dummy voxels
+        voxel_roi_padded = np.concatenate([
+            voxel_roi_sorted, np.full(pad_len, 8, dtype=np.int64)])
+    else:
+        voxel_roi_padded = voxel_roi_sorted
+
+    num_patches = padded // patch_size
+
+    # Majority-vote: for each patch, pick the most common ROI label
+    patch_roi_ids = np.zeros(num_patches, dtype=np.int64)
+    for p in range(num_patches):
+        chunk = voxel_roi_padded[p * patch_size: (p + 1) * patch_size]
+        roi_counts = np.bincount(chunk, minlength=len(ROI_GROUPS))
+        patch_roi_ids[p] = int(np.argmax(roi_counts))
+
+    return perm, patch_roi_ids
+

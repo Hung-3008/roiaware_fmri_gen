@@ -18,10 +18,11 @@ Architecture:
   → output_proj → unpatchify → v_pred (B, n_voxels)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
-from typing import Optional
+from typing import List, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -86,6 +87,15 @@ class BrainFlowV2Config:
     # Conditioning
     cond_dim: int = 512        # internal conditioning dimension
     use_cross_attention: bool = True  # cross-attn with image patch tokens
+
+    # ROI-sort & ROI-aware positional embedding
+    # voxel_perm: permutation index array (n_voxels,) int64 — ROI-sorted order
+    # patch_roi_ids: ROI label (0-8) for each patch (num_patches,) int64
+    # Both are set externally by training script via build_roi_perm().
+    voxel_perm: Optional[List[int]] = None    # None = no sort (legacy)
+    patch_roi_ids: Optional[List[int]] = None # None = use learned pos embed
+    n_rois: int = 9                           # number of ROI groups
+    use_roi_pos_embed: bool = False           # True when patch_roi_ids set
 
 
 # ─── Representation Encoder ──────────────────────────────────────────────────
@@ -330,10 +340,39 @@ class BrainFlowV2(nn.Module):
         self.num_patches = self.padded_voxels // config.patch_size
         self.pad_len = self.padded_voxels - config.n_voxels
 
+        # ── ROI-Sort: register voxel permutation as a buffer ──
+        if config.voxel_perm is not None:
+            perm = torch.tensor(config.voxel_perm, dtype=torch.long)
+            # inverse permutation: to restore original ordering in unpatchify
+            inv_perm = torch.argsort(perm)
+            self.register_buffer('voxel_perm', perm)
+            self.register_buffer('voxel_inv_perm', inv_perm)
+        else:
+            self.voxel_perm = None
+            self.voxel_inv_perm = None
+
         # Patch embedding: patch_size → D
         self.patch_embed = nn.Linear(config.patch_size, D)
-        self.patch_pos_embed = nn.Parameter(
-            torch.randn(1, self.num_patches, D) * 0.02)
+
+        # ── Positional Embedding ──
+        # ROI-aware: embed each patch with its ROI label (shared within ROI)
+        # + a small patch-level learned bias for within-ROI positional info
+        self.use_roi_pos_embed = config.use_roi_pos_embed
+        if config.use_roi_pos_embed and config.patch_roi_ids is not None:
+            # Register ROI labels as a buffer (not trained)
+            roi_ids = torch.tensor(config.patch_roi_ids, dtype=torch.long)  # (num_patches,)
+            self.register_buffer('patch_roi_ids', roi_ids)
+            # Learned ROI embedding: maps ROI label → D vector
+            self.roi_embed = nn.Embedding(config.n_rois, D)
+            nn.init.normal_(self.roi_embed.weight, std=0.02)
+            # Small learned per-patch bias (fine-grained, initialised near 0)
+            self.patch_pos_bias = nn.Parameter(torch.randn(1, self.num_patches, D) * 0.005)
+        else:
+            # Legacy: fully learnable positional embedding (index-based)
+            self.patch_roi_ids = None
+            self.roi_embed = None
+            self.patch_pos_embed = nn.Parameter(
+                torch.randn(1, self.num_patches, D) * 0.02)
 
         # ── DiT Blocks ──
         dpr = [x.item() for x in torch.linspace(
@@ -380,16 +419,26 @@ class BrainFlowV2(nn.Module):
         nn.init.zeros_(self.final_adaLN[1].bias)
 
     def _patchify(self, x):
-        """(B, n_voxels) → (B, num_patches, patch_size)"""
+        """(B, n_voxels) → (B, num_patches, patch_size)
+        If voxel_perm is set, voxels are first reordered by ROI
+        so that each patch contains voxels from the same ROI.
+        """
+        if self.voxel_perm is not None:
+            x = x[:, self.voxel_perm]   # ROI-sorted reorder (B, n_voxels)
         if self.pad_len > 0:
             x = F.pad(x, (0, self.pad_len))
         return x.view(x.shape[0], self.num_patches, self.config.patch_size)
 
     def _unpatchify(self, x):
-        """(B, num_patches, patch_size) → (B, n_voxels)"""
+        """(B, num_patches, patch_size) → (B, n_voxels)
+        If voxel_perm is set, applies inverse permutation to restore
+        the original voxel ordering.
+        """
         x = x.reshape(x.shape[0], -1)  # (B, padded_voxels)
         if self.pad_len > 0:
             x = x[:, :self.config.n_voxels]
+        if self.voxel_inv_perm is not None:
+            x = x[:, self.voxel_inv_perm]   # restore original ordering
         return x
 
     def forward(self, t, x_t, image, drop_repr=False):
@@ -427,9 +476,17 @@ class BrainFlowV2(nn.Module):
                 self.context_proj(patch_tokens))  # (B, N, D)
 
         # ── fMRI tokens ──
-        x_patches = self._patchify(x_t)                        # (B, 128, 124)
-        x_tokens = self.patch_embed(x_patches) + self.patch_pos_embed
-        # (B, 128, D)
+        x_patches = self._patchify(x_t)             # (B, num_patches, patch_size)
+        x_tokens = self.patch_embed(x_patches)       # (B, num_patches, D)
+
+        # Positional embedding: ROI-aware or legacy index-based
+        if self.use_roi_pos_embed and self.roi_embed is not None:
+            # roi_embed broadcasts: (num_patches,) → (1, num_patches, D)
+            roi_pos = self.roi_embed(self.patch_roi_ids).unsqueeze(0)  # (1, P, D)
+            x_tokens = x_tokens + roi_pos + self.patch_pos_bias
+        else:
+            x_tokens = x_tokens + self.patch_pos_embed
+        # (B, num_patches, D)
 
         # ── DiT Blocks (self-attn + cross-attn + FFN) ──
         for block in self.blocks:

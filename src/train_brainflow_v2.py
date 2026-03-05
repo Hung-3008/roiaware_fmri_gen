@@ -39,25 +39,50 @@ from torchcfm.conditional_flow_matching import (
 from src.model.brain_flow_v2 import (
     BrainFlowV2, BrainFlowV2Config, timestep_embedding, modulate,
 )
-from src.utils.roi_utils import ROIDecomposer
+from src.utils.roi_utils import ROIDecomposer, build_roi_perm
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 
 
 class FmriImageDataset(Dataset):
-    """Dataset pairing fMRI with raw stimulus images."""
+    """Dataset pairing fMRI with raw stimulus images.
+
+    Supports two modes:
+      - Averaged mode (default): fMRI (N, R, V) → mean over R → (N, V)
+      - Single-trial mode: fMRI (N, R, V) → expand to (N*R, V), each trial
+        maps back to its original image index. ~3x more training data.
+    """
 
     def __init__(self, fmri_path, stim_path, image_dir,
-                 split="train", image_size=224, max_samples=0):
+                 split="train", image_size=224, max_samples=0,
+                 use_single_trials=False):
         print(f"\nFmriImageDataset [{split}]: Loading...")
 
         # Load fMRI
         raw_fmri = np.load(fmri_path)
-        if raw_fmri.ndim == 3:
+        if raw_fmri.ndim == 3 and use_single_trials:
+            # Single-trial mode: (N, R, V) → (N*R, V)
+            N, R, V = raw_fmri.shape
+            fmri = raw_fmri.reshape(N * R, V).astype(np.float32)
+            # Also store avg fMRI (N, V) for per-ROI soft target
+            fmri_avg = raw_fmri.mean(axis=1).astype(np.float32)  # (N, V)
+            self.fmri_avg = fmri_avg
+            # Map each trial back to its original image index
+            self.img_indices = np.repeat(np.arange(N), R)
+            self.has_avg = True
+            print(f"  Single-trial mode: ({N}, {R}, {V}) → ({N*R}, {V})")
+            print(f"  Also loaded avg fMRI: {fmri_avg.shape}")
+        elif raw_fmri.ndim == 3:
             fmri = raw_fmri.mean(axis=1).astype(np.float32)
+            self.fmri_avg = fmri   # avg IS the fmri in this case
+            self.img_indices = None
+            self.has_avg = False
         elif raw_fmri.ndim == 2:
             fmri = raw_fmri.astype(np.float32)
+            self.fmri_avg = fmri
+            self.img_indices = None
+            self.has_avg = False
         else:
             raise ValueError(f"Unexpected fMRI shape: {raw_fmri.shape}")
         del raw_fmri
@@ -86,6 +111,9 @@ class FmriImageDataset(Dataset):
         if max_samples > 0:
             self.n_samples = min(max_samples, self.n_samples)
             self.fmri = self.fmri[:self.n_samples]
+            if self.img_indices is not None:
+                self.img_indices = self.img_indices[:self.n_samples]
+            # Note: fmri_avg keeps full N entries; we use img_indices to index it
 
         # Image transforms (ImageNet normalization)
         self.transform = transforms.Compose([
@@ -107,17 +135,24 @@ class FmriImageDataset(Dataset):
     def __getitem__(self, idx):
         fmri = torch.from_numpy(self.fmri[idx]).float()
 
+        # Get original image index (for single-trial mode)
+        img_idx = int(self.img_indices[idx]) if self.img_indices is not None \
+            else idx
+
+        # Average fMRI (same image, averaged over 3 trials)
+        fmri_avg = torch.from_numpy(self.fmri_avg[img_idx]).float()
+
         # Load image
         if self.use_png:
-            img_path = os.path.join(self.image_dir, f"{idx}.png")
+            img_path = os.path.join(self.image_dir, f"{img_idx}.png")
             image = Image.open(img_path).convert('RGB')
         else:
             # From numpy stim array (H, W, C) uint8
-            img_array = np.array(self.stim_mmap[idx])
+            img_array = np.array(self.stim_mmap[img_idx])
             image = Image.fromarray(img_array)
 
         image = self.transform(image)
-        return fmri, image
+        return fmri, fmri_avg, image
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -281,8 +316,9 @@ def validate(model, val_loader, fm, device, ode_steps=50,
     all_pred, all_true = [], []
     all_v_cos = []
 
-    for fmri, image in val_loader:
+    for fmri, fmri_avg, image in val_loader:
         fmri, image = fmri.to(device), image.to(device)
+        # fmri_avg not needed in val (val always uses averaged fMRI)
 
         # Flow loss
         x0 = torch.randn_like(fmri)
@@ -350,6 +386,12 @@ def main():
         "BrainFlow V2 — FlowFM-Style Direct Flow Matching")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from latest.pt in output_dir")
+    parser.add_argument(
+        "--resume_from", type=str, default=None,
+        help="Path to a specific checkpoint .pt file to resume from")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -377,6 +419,25 @@ def main():
     sampler = train_cfg.get("sampler", "ode")
     freeze_encoder_epochs = train_cfg.get("freeze_encoder_epochs", 0)
 
+    # Per-ROI soft target options
+    use_per_roi_soft = train_cfg.get("use_per_roi_soft_target", True)
+    # alpha per ROI: alpha=1 → use only avg, alpha=0 → use only single trial
+    # Default: scaled by ROI hierarchy (early=low alpha, late/other=high alpha)
+    _default_roi_alphas = {
+        "V1":    0.3,   # high SNR retinotopic, keep more trial variability
+        "V2":    0.3,
+        "V3":    0.5,
+        "hV4":   0.5,
+        "body":  0.65,  # floc areas more variable
+        "face":  0.65,
+        "place": 0.65,
+        "word":  0.65,
+        "other": 0.8,   # mixed voxels, mostly use avg
+    }
+    _cfg_roi_alphas = train_cfg.get("roi_soft_alphas", {})
+    # Merge defaults with any user overrides from config
+    roi_alpha_map = {**_default_roi_alphas, **_cfg_roi_alphas}
+
     # Flow options
     use_ot = train_cfg.get("use_ot", True)
     sigma = train_cfg.get("sigma", 0.0)
@@ -393,6 +454,7 @@ def main():
     magnitude_weight = train_cfg.get("magnitude_weight", 0.1)
 
     image_size = data_cfg.get("image_size", 224)
+    use_single_trials = data_cfg.get("use_single_trials", False)
 
     output_dir = cfg.get("output_dir", "results/brainflow_v2")
     os.makedirs(output_dir, exist_ok=True)
@@ -419,6 +481,35 @@ def main():
     roi_names = decomposer.get_roi_names()
     logger.info(f"\n{decomposer.summary()}")
 
+    # ── ROI-Sort Permutation (for ROI-aware patching) ──
+    # Build once from ROIDecomposer; inject into model config automatically.
+    # Set use_roi_pos_embed: false in config.yaml to disable.
+    if model_cfg.get("use_roi_pos_embed", True):
+        patch_size = model_cfg.get("patch_size", 124)
+        n_voxels = model_cfg.get("n_voxels", 15724)
+        voxel_perm, patch_roi_ids = build_roi_perm(
+            decomposer, patch_size, n_voxels)
+        model_cfg["voxel_perm"] = voxel_perm.tolist()
+        model_cfg["patch_roi_ids"] = patch_roi_ids.tolist()
+        model_cfg["use_roi_pos_embed"] = True
+        logger.info(
+            f"ROI-sort: built voxel_perm ({len(voxel_perm)} voxels), "
+            f"patch_roi_ids ({len(patch_roi_ids)} patches)")
+    else:
+        logger.info("ROI-sort: disabled (use_roi_pos_embed=false)")
+
+    # ── Per-ROI soft alpha list (ordered by decomposer.rois) ──
+    # roi_soft_alphas[i] = alpha for decomposer.rois[i]
+    roi_soft_alphas = [roi_alpha_map.get(roi.name, 0.5)
+                       for roi in decomposer.rois]
+    if use_per_roi_soft:
+        alpha_str = ", ".join(
+            f"{roi.name}={a:.2f}" for roi, a in
+            zip(decomposer.rois, roi_soft_alphas))
+        logger.info(f"Per-ROI soft target: ON | {alpha_str}")
+    else:
+        logger.info("Per-ROI soft target: OFF (use_per_roi_soft_target=false)")
+
     # ── Data ──
     subject = data_cfg.get("subject", "subj01")
     sub_num = int(subject.replace("subj", "").lstrip("0"))
@@ -441,11 +532,13 @@ def main():
 
     train_ds = FmriImageDataset(
         train_fmri, train_stim, train_img_dir,
-        split="train", image_size=image_size, max_samples=debug_n)
+        split="train", image_size=image_size, max_samples=debug_n,
+        use_single_trials=use_single_trials)
     val_ds = FmriImageDataset(
         val_fmri, val_stim, val_img_dir,
         split="test", image_size=image_size,
-        max_samples=debug_n // 4 if args.debug else 0)
+        max_samples=debug_n // 4 if args.debug else 0,
+        use_single_trials=False)  # val always averaged for fair comparison
 
     if args.debug:
         batch_size = min(batch_size, 16)
@@ -491,6 +584,32 @@ def main():
          "lr": lr, "name": "velocity"},
     ], weight_decay=train_cfg.get("weight_decay", 0.05))
     base_lrs = [encoder_lr, lr]
+
+    # ── Resume from checkpoint ──
+    start_epoch = 1
+    best_pcc = -1.0
+    patience_counter = 0
+
+    resume_path = None
+    if args.resume_from:
+        resume_path = args.resume_from
+    elif args.resume:
+        resume_path = os.path.join(output_dir, "latest.pt")
+
+    if resume_path and os.path.exists(resume_path):
+        logger.info(f"\n► Resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if use_ema and "ema_state_dict" in ckpt:
+            ema_model.load_state_dict(ckpt["ema_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_pcc = ckpt.get("best_pcc", -1.0)
+        logger.info(
+            f"  Resumed epoch={ckpt['epoch']} | best_pcc={best_pcc:.4f} "
+            f"| continuing from epoch {start_epoch}")
+    elif resume_path:
+        logger.warning(f"  Checkpoint not found at {resume_path}, training from scratch")
     logger.info(
         f"Optimizer: encoder_lr={encoder_lr:.2e}, velocity_lr={lr:.2e}")
 
@@ -503,11 +622,14 @@ def main():
         "val_flow_loss", "val_v_cos",
         "val_fmri_mse", "val_fmri_pcc", "val_fmri_spcc",
     ] + roi_fields
-    with open(history_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=fields).writeheader()
+    # On resume: append to existing CSV. On fresh start: write header.
+    is_resuming = (start_epoch > 1)
+    with open(history_path, "a" if is_resuming else "w", newline="") as f:
+        if not is_resuming:
+            csv.DictWriter(f, fieldnames=fields).writeheader()
 
-    best_pcc = -1.0
-    patience_counter = 0
+    best_pcc = best_pcc  # already set above (from checkpoint or default -1.0)
+    patience_counter = patience_counter  # already set above
     patience = train_cfg.get("patience", 200)
 
     # ── Training ──
@@ -527,7 +649,17 @@ def main():
         + (f" | huber_c={huber_c}"
            if velocity_loss_type == "pseudo_huber" else ""))
 
-    for epoch in range(1, num_epochs + 1):
+    # Precompute ROI index tensors on device (once) for per-ROI soft target
+    # Avoids creating a new tensor every batch inside the training loop
+    if use_per_roi_soft:
+        roi_index_tensors = [
+            torch.tensor(roi.indices, dtype=torch.long, device=device)
+            for roi in decomposer.rois
+        ]
+    else:
+        roi_index_tensors = None
+
+    for epoch in range(start_epoch, num_epochs + 1):
         model.train()
 
         # Encoder freeze/unfreeze
@@ -548,13 +680,29 @@ def main():
         grads_all, grads_max_all = [], []
         t0 = time.time()
 
-        for batch_idx, (fmri, image) in enumerate(train_loader):
-            fmri, image = fmri.to(device), image.to(device)
+        for batch_idx, (fmri, fmri_avg, image) in enumerate(train_loader):
+            fmri, fmri_avg, image = (
+                fmri.to(device), fmri_avg.to(device), image.to(device))
             B = fmri.shape[0]
 
-            # ─── Flow Matching: x0=noise, x1=fmri ─────
-            x0 = torch.randn_like(fmri)
-            x1 = fmri
+            # ─── Per-ROI Soft Target ───────────────────────────────────────
+            # Build x1 as weighted mix of single trial + avg per ROI.
+            # ROIs with high SNR (V1/V2) keep more single-trial variability;
+            # noisy ROIs (other) use mostly avg to reduce velocity conflict.
+            if use_per_roi_soft:
+                x1 = fmri.clone()
+                for roi_indices, alpha in zip(roi_index_tensors, roi_soft_alphas):
+                    # x1_r = alpha * avg_r + (1-alpha) * trial_r
+                    x1[:, roi_indices] = (
+                        alpha * fmri_avg[:, roi_indices]
+                        + (1 - alpha) * fmri[:, roi_indices]
+                    )
+            else:
+                x1 = fmri
+            # ──────────────────────────────────────────────────────────────
+
+            # ─── Flow Matching: x0=noise, x1=soft_target ──────────────────
+            x0 = torch.randn_like(x1)
 
             # DGS: Dynamic Guidance Switching on representation
             drop_mask = torch.rand(B, device=device) < cfg_drop_prob
@@ -594,8 +742,13 @@ def main():
                     model.context_proj(patch_tokens))
 
             x_patches = model._patchify(xt)
-            x_tokens = (model.patch_embed(x_patches)
-                        + model.patch_pos_embed)
+            x_tokens = model.patch_embed(x_patches)
+            # Positional embedding: ROI-aware or legacy
+            if model.use_roi_pos_embed and model.roi_embed is not None:
+                roi_pos = model.roi_embed(model.patch_roi_ids).unsqueeze(0)
+                x_tokens = x_tokens + roi_pos + model.patch_pos_bias
+            else:
+                x_tokens = x_tokens + model.patch_pos_embed
 
             for block in model.blocks:
                 x_tokens = block(x_tokens, c, context)
@@ -706,18 +859,22 @@ def main():
                 logger.info(f"  Early stopping at epoch {epoch}")
                 break
 
+        # Save latest.pt every epoch (enables resume at any point)
+        save_dict = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_pcc": best_pcc,
+            "config": cfg,
+        }
+        if use_ema:
+            save_dict["ema_state_dict"] = ema_model.state_dict()
+        torch.save(save_dict, os.path.join(output_dir, "latest.pt"))
+
+        # Save periodic snapshot (every save_every epochs)
         if epoch % train_cfg.get("save_every", 50) == 0:
-            save_dict = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_pcc": best_pcc,
-                "config": cfg,
-            }
-            if use_ema:
-                save_dict["ema_state_dict"] = ema_model.state_dict()
             torch.save(save_dict,
-                       os.path.join(output_dir, "latest.pt"))
+                       os.path.join(output_dir, f"ckpt_ep{epoch:04d}.pt"))
 
     logger.info(f"Done! Best PCC: {best_pcc:.4f}")
 
