@@ -2,34 +2,35 @@ data:
   root: Data/nsd
   subject: subj01
   image_size: 224
-  use_single_trials: true   # expand (N,R,V) → (N*R,V), ~3x more data
+  use_single_trials: true    # expand (N,R,V) → (N*R,V), ~3x more data
 
 model:
   n_voxels: 15724
   patch_size: 124
   hidden_dim: 768
-  depth: 12
+  depth: 8
   num_heads: 12
   mlp_ratio: 4.0
   dropout: 0.1
   drop_path_rate: 0.1
   # Representation Encoder
-  encoder_name: vit_large_patch14_dinov2
-  encoder_dim: 1024
+  encoder_name: vit_base_patch14_dinov2
+  encoder_dim: 768
   encoder_pretrained: true
-  cond_dim: 1024
+  cond_dim: 768
   use_cross_attention: true
+  cross_attn_interval: 2    # cross-attn on even blocks only (0,2,4,6)
 
 training:
-  batch_size: 48          # reduced from 32 for ViT-Large VRAM
+  batch_size: 32          # reduced from 32 for ViT-Large VRAM
   lr: 0.0003
   encoder_lr: 0.00003     # 10x smaller for pretrained encoder
   num_epochs: 300          # reduced from 500, since 3x more data/epoch
   warmup_epochs: 20
   freeze_encoder_epochs: 30  # freeze encoder for first 30 epochs
-  grad_clip: 1.0
+  grad_clip: 0.5
   weight_decay: 0.1
-  ema_decay: 0.999
+  ema_decay: 0.99
   use_ema: true
   eval_interval: 10    # evaluate every 10 epochs (was 5, saves ~14min per 5ep)
   patience: 40
@@ -44,11 +45,11 @@ training:
 
   # DGS (Dynamic Guidance Switching)
   cfg_drop_prob: 0.4
-  cfg_scale: 1.0
+  cfg_scale: 1.5
 
   # Sampling — ode_steps=20 during training (fast trend monitoring)
   # Use 100+ steps only for final evaluation after training
-  ode_steps: 20
+  ode_steps: 50
   num_trials: 1
   sampler: ode
 
@@ -61,7 +62,7 @@ training:
   # alpha=0 → pure single trial, alpha=1 → pure avg
   # Early visual (V1/V2): high SNR → keep more single-trial variability
   # Late/other: noisy → use more avg to stabilize velocity field
-  use_per_roi_soft_target: false
+  use_per_roi_soft_target: true
   roi_soft_alphas:
     V1:    0.15   # 85% single trial (high SNR, retinotopic)
     V2:    0.15
@@ -73,12 +74,5 @@ training:
     word:  0.55
     other: 0.75   # 25% single trial (noisy mixed voxels)
 
-pca:
-  enabled: true
-  variance_ratio: 0.95     # retain 95% variance per ROI
-  # Optional: explicit n_components per ROI (overrides variance_ratio)
-  # n_components:
-  #   V1: 200
-  #   V2: 200
 
 output_dir: results/subj01/brainflow_v2

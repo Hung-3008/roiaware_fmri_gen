@@ -71,22 +71,23 @@ class BrainFlowV2Config:
     patch_size: int = 124       # 15724 → pad to 15872 → 128 patches
 
     # Transformer (velocity network)
-    hidden_dim: int = 512
-    depth: int = 12
-    num_heads: int = 8
+    hidden_dim: int = 768
+    depth: int = 8
+    num_heads: int = 12
     mlp_ratio: float = 4.0
     dropout: float = 0.1
     drop_path_rate: float = 0.1
 
     # Representation Encoder
-    encoder_name: str = "vit_small_patch14_dinov2"
-    encoder_dim: int = 384     # ViT-S output dimension
+    encoder_name: str = "vit_base_patch14_dinov2"
+    encoder_dim: int = 768     # ViT-B output dimension
     encoder_pretrained: bool = True
     image_size: int = 224
 
     # Conditioning
-    cond_dim: int = 512        # internal conditioning dimension
+    cond_dim: int = 768        # internal conditioning dimension
     use_cross_attention: bool = True  # cross-attn with image patch tokens
+    cross_attn_interval: int = 2     # cross-attn every N blocks (0=none, 1=all, 2=even)
 
     # ROI-sort & ROI-aware positional embedding
     # voxel_perm: permutation index array (n_voxels,) int64 — ROI-sorted order
@@ -374,7 +375,7 @@ class BrainFlowV2(nn.Module):
             self.patch_pos_embed = nn.Parameter(
                 torch.randn(1, self.num_patches, D) * 0.02)
 
-        # ── DiT Blocks ──
+        # ── DiT Blocks (selective cross-attention) ──
         dpr = [x.item() for x in torch.linspace(
             0, config.drop_path_rate, config.depth)]
         self.blocks = nn.ModuleList([
@@ -384,7 +385,11 @@ class BrainFlowV2(nn.Module):
                 mlp_ratio=config.mlp_ratio,
                 dropout=config.dropout,
                 drop_path_rate=dpr[i],
-                use_cross_attention=config.use_cross_attention,
+                use_cross_attention=(
+                    config.use_cross_attention
+                    and config.cross_attn_interval > 0
+                    and (i % config.cross_attn_interval == 0)
+                ),
             )
             for i in range(config.depth)
         ])
